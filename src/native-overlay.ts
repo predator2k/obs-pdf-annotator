@@ -370,11 +370,10 @@ export class NativePdfOverlay {
 
   private toolbarSwatchesEl: HTMLElement | null = null;
   private fitWidthBtn: HTMLElement | null = null;
-  private sidebarTabBtn: HTMLElement | null = null;
+  private hiddenNativeFitEl: HTMLElement | null = null;
   private sidebarViewEl: HTMLElement | null = null;
   private sidebarActive = false;
-  private sidebarActiveToken = "mod-active";
-  private sidebarStrippedEl: HTMLElement | null = null;
+  private menuObserver: MutationObserver | null = null;
   private toolbarStylesEl: HTMLElement | null = null;
   private tagBtn: HTMLButtonElement | null = null;
   private listBtn: HTMLButtonElement | null = null;
@@ -727,47 +726,31 @@ export class NativePdfOverlay {
     };
     zoomInEl.insertAdjacentElement("afterend", btn);
     this.fitWidthBtn = btn;
+
+    // The native control right after zoom-in cycles fit-height/fit-width; a
+    // dedicated fit-width button makes it redundant. Hide it only when it is
+    // recognizably that control, and restore it on teardown.
+    const next = btn.nextElementSibling as HTMLElement | null;
+    const label = `${next?.getAttribute("aria-label") ?? ""} ${next?.getAttribute("title") ?? ""}`;
+    if (next && /fit/i.test(label)) {
+      this.hiddenNativeFitEl = next;
+      next.style.display = "none";
+    }
   }
 
-  /** Annotations as a third native-sidebar choice beside Thumbnails/Outline.
-   * Returns availability; callers fall back to the floating panel without it. */
+  /** Annotations as a third native-sidebar choice. Obsidian's sidebar picker
+   * is a dropdown menu, so the entry is injected into that menu when it opens
+   * (see watchSidebarMenus); this only prepares the in-sidebar view. Returns
+   * availability; callers fall back to the floating panel without it. */
   private ensureSidebarTab(): boolean {
     if (this.destroyed) return false;
-    if (this.sidebarTabBtn?.isConnected && this.sidebarViewEl?.isConnected) return true;
+    if (this.sidebarViewEl?.isConnected) return true;
     const v = this.nativeViewer();
     const sidebar = v?.pdfSidebar;
-    const options = v?.toolbar?.sidebarOptionsEl as HTMLElement | undefined;
     const content = (sidebar?.thumbnailView as HTMLElement | undefined)?.parentElement;
-    if (!sidebar || !options?.isConnected || !content) return false;
+    if (!sidebar || !content) return false;
 
-    this.sidebarTabBtn?.remove();
     this.sidebarViewEl?.remove();
-
-    // Mirror the native option buttons: same tag + classes (minus any active
-    // marker, which we also learn here so ours toggles the native way).
-    const sample = options.firstElementChild as HTMLElement | null;
-    for (const token of ["mod-active", "is-active", "active"]) {
-      if (sample?.classList.contains(token) || options.querySelector(`.${token}`)) {
-        this.sidebarActiveToken = token;
-        break;
-      }
-    }
-    const btn = options.ownerDocument.createElement(sample?.tagName.toLowerCase() ?? "button");
-    if (sample) {
-      btn.className = Array.from(sample.classList)
-        .filter((c) => !["mod-active", "is-active", "active"].includes(c))
-        .join(" ");
-    }
-    btn.classList.add("lpa-sidebar-tab");
-    btn.setText("Annotations");
-    btn.setAttribute("aria-label", "Annotations");
-    btn.addEventListener("click", (evt) => {
-      evt.preventDefault();
-      evt.stopPropagation();
-      this.setSidebarAnnotationsActive(!this.sidebarActive);
-    });
-    options.appendChild(btn);
-    this.sidebarTabBtn = btn;
 
     // Our tab view overlays the whole content area; anchor it to the
     // container even when the native DOM leaves it statically positioned.
@@ -783,35 +766,64 @@ export class NativePdfOverlay {
     if (bus?.on) {
       const onViewChanged = () => {
         // The user picked Thumbnails/Outline — those own the panel again.
-        if (this.sidebarActive) this.setSidebarAnnotationsActive(false, true);
+        if (this.sidebarActive) this.setSidebarAnnotationsActive(false);
       };
       bus.on("sidebarviewchanged", onViewChanged);
       this.cleanups.push(() => bus.off?.("sidebarviewchanged", onViewChanged));
     }
+    this.watchSidebarMenus();
     if (this.sidebarActive) this.setSidebarAnnotationsActive(true);
     return true;
   }
 
-  private setSidebarAnnotationsActive(on: boolean, fromNative = false): void {
-    const v = this.nativeViewer();
-    const sidebar = v?.pdfSidebar;
-    this.sidebarActive = on;
-    const token = this.sidebarActiveToken;
-    if (on) {
-      sidebar?.open?.();
-      // Hand the highlight to our tab; remember whose we took.
-      const options = v?.toolbar?.sidebarOptionsEl as HTMLElement | undefined;
-      const current = options?.querySelector<HTMLElement>(`.${token}`);
-      if (current && current !== this.sidebarTabBtn) {
-        this.sidebarStrippedEl = current;
-        current.classList.remove(token);
+  /** Inject "Annotations" into the native sidebar dropdown menu (the one with
+   * Thumbnails / Table of contents) whenever it opens. */
+  private watchSidebarMenus(): void {
+    if (this.menuObserver) return;
+    const doc = this.contentRoot?.ownerDocument;
+    if (!doc) return;
+    this.menuObserver = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of Array.from(m.addedNodes)) {
+          if (node instanceof HTMLElement && node.matches(".menu")) this.maybeExtendSidebarMenu(node);
+        }
       }
-      this.sidebarTabBtn?.classList.add(token);
+    });
+    this.menuObserver.observe(doc.body, { childList: true });
+    this.cleanups.push(() => {
+      this.menuObserver?.disconnect();
+      this.menuObserver = null;
+    });
+  }
+
+  private maybeExtendSidebarMenu(menuEl: HTMLElement): void {
+    if (this.destroyed || menuEl.querySelector(".lpa-menu-annotations")) return;
+    const items = Array.from(menuEl.querySelectorAll<HTMLElement>(".menu-item"));
+    const thumbs = items.find((el) => el.textContent?.includes("Thumbnails"));
+    const outline = items.find((el) => el.textContent?.includes("Table of contents"));
+    if (!thumbs || !outline) return; // some other menu
+
+    const item = menuEl.ownerDocument.createElement("div");
+    item.className = "menu-item tappable lpa-menu-annotations";
+    const iconEl = item.createDiv({ cls: "menu-item-icon" });
+    if (this.sidebarActive) setIcon(iconEl, "check");
+    item.createDiv({ cls: "menu-item-title", text: "Annotations" });
+    item.addEventListener("click", () => {
+      // Do not stop propagation: the bubbling click is what closes the menu.
+      this.setSidebarAnnotationsActive(true);
+    });
+    outline.insertAdjacentElement("afterend", item);
+  }
+
+  private setSidebarAnnotationsActive(on: boolean): void {
+    if (on && !this.ensureSidebarTab()) {
+      this.toggleListPanel();
+      return;
+    }
+    this.sidebarActive = on;
+    if (on) {
+      this.nativeViewer()?.pdfSidebar?.open?.();
       this.renderListItems();
-    } else {
-      this.sidebarTabBtn?.classList.remove(token);
-      if (!fromNative) this.sidebarStrippedEl?.classList.add(token);
-      this.sidebarStrippedEl = null;
     }
     this.sidebarViewEl?.toggleClass("is-active", on);
     this.syncToolbarState();
@@ -830,12 +842,13 @@ export class NativePdfOverlay {
     this.countEl = null;
     this.fitWidthBtn?.remove();
     this.fitWidthBtn = null;
-    this.sidebarTabBtn?.remove();
-    this.sidebarTabBtn = null;
+    if (this.hiddenNativeFitEl) {
+      this.hiddenNativeFitEl.style.display = "";
+      this.hiddenNativeFitEl = null;
+    }
     this.sidebarViewEl?.remove();
     this.sidebarViewEl = null;
     this.sidebarActive = false;
-    this.sidebarStrippedEl = null;
   }
 
   private syncToolbarState(): void {

@@ -1983,3 +1983,12 @@
 .lpa-fit-width-btn {
   display: inline-flex;
 }
+
+/* Injected "Annotations" entry in the native sidebar menu: Obsidian only
+   highlights its own items on hover, so provide the affordance ourselves. */
+.menu .lpa-menu-annotations {
+  cursor: var(--cursor);
+}
+.menu .lpa-menu-annotations:hover {
+  background-color: var(--background-modifier-hover);
+}
