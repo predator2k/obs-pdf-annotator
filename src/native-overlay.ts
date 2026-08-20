@@ -165,7 +165,8 @@ export class NativeOverlayManager {
     private bundleManager?: PdfBundleManager,
     private getShowMarginCards: () => boolean = () => false,
     private pen?: PenState,
-    private hub?: AnnotationHub
+    private hub?: AnnotationHub,
+    private getMobileSelectionDelay: () => number = () => 3000
   ) {}
 
   private get app(): App {
@@ -266,7 +267,8 @@ export class NativeOverlayManager {
       this.bundleManager,
       this.getShowMarginCards,
       this.pen,
-      this.hub
+      this.hub,
+      this.getMobileSelectionDelay
     );
     this.overlays.set(leaf, overlay);
     this.refresh();
@@ -412,7 +414,8 @@ export class NativePdfOverlay {
     private bundleManager?: PdfBundleManager,
     private getShowMarginCards: () => boolean = () => false,
     private pen?: PenState,
-    private hub?: AnnotationHub
+    private hub?: AnnotationHub,
+    private getMobileSelectionDelay: () => number = () => 3000
   ) {
     this.hubKey = `overlay-${newId()}`;
     if (pen) {
@@ -1558,7 +1561,7 @@ export class NativePdfOverlay {
         const last = rects[rects.length - 1];
         if (!last) return;
         void this.captureSelection(cur, last.right, last.bottom);
-      }, 3000);
+      }, Math.max(0, this.getMobileSelectionDelay()));
     }
   }
 

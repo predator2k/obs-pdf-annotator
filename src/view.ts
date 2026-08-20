@@ -211,7 +211,8 @@ export class PdfAnnotatorView extends FileView {
     private bundleManager?: PdfBundleManager,
     private getShowMarginCards: () => boolean = () => false,
     private pen?: PenState,
-    private hub?: AnnotationHub
+    private hub?: AnnotationHub,
+    private getMobileSelectionDelay: () => number = () => 3000
   ) {
     super(leaf);
     this.navigation = true;
@@ -1397,7 +1398,7 @@ export class PdfAnnotatorView extends FileView {
         if (!cur || cur.isCollapsed || cur.toString().trim().length === 0) return;
         const pending = this.snapshotSelection(cur);
         if (pending) this.showSelectionHandle(pending);
-      }, 350);
+      }, Math.max(0, this.getMobileSelectionDelay()));
     }
   }
 

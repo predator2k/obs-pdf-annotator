@@ -64,6 +64,8 @@ interface LpaSettings {
   lastMarkStyle: string | null;
   /** Toolbar color armed: selections highlight instantly without the popover. */
   penArmed: boolean;
+  /** Mobile: ms the selection must hold still before the popup / armed commit. */
+  mobileSelectionDelayMs: number;
 }
 
 const DEFAULT_SETTINGS: LpaSettings = {
@@ -77,6 +79,7 @@ const DEFAULT_SETTINGS: LpaSettings = {
   lastColorFill: null,
   lastMarkStyle: null,
   penArmed: false,
+  mobileSelectionDelayMs: 3000,
 };
 
 function coerceAnnotationStorageMode(value: string): AnnotationStorageMode {
@@ -115,7 +118,8 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
           this.bundleManager,
           () => this.settings.showMarginCards,
           this.pen(),
-          this.annotationHub
+          this.annotationHub,
+          () => this.settings.mobileSelectionDelayMs
         )
     );
 
@@ -128,7 +132,8 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
       this.bundleManager,
       () => this.settings.showMarginCards,
       this.pen(),
-      this.annotationHub
+      this.annotationHub,
+      () => this.settings.mobileSelectionDelayMs
     );
 
     // Trigger 1: command palette.
@@ -363,6 +368,10 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
       this.settings.annotationStorageMode
     );
     this.settings.documentIdentity = coerceDocumentIdentity(this.settings.documentIdentity);
+    const delay = Number(this.settings.mobileSelectionDelayMs);
+    this.settings.mobileSelectionDelayMs = Number.isFinite(delay)
+      ? Math.min(10000, Math.max(0, Math.round(delay)))
+      : 3000;
     this.applyPaletteFromSettings();
     this.settings.annotationStorageFolder = normalizeAnnotationStorageFolder(
       this.settings.annotationStorageFolder
@@ -528,6 +537,24 @@ class LpaSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           this.plugin.refreshAnnotationUi();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Selection popup delay on mobile")
+      .setDesc(
+        "How long a text selection must hold still before the popup appears (or an armed " +
+          "color commits) on phones and tablets. Prevents fights with the system selection " +
+          "handles. Desktop is always instant."
+      )
+      .addSlider((sl) =>
+        sl
+          .setLimits(0, 5000, 250)
+          .setValue(this.plugin.settings.mobileSelectionDelayMs)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.mobileSelectionDelayMs = v;
+            await this.plugin.saveSettings();
+          })
       );
 
     new Setting(containerEl)
