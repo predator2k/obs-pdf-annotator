@@ -402,6 +402,7 @@ export class NativePdfOverlay {
   private scrollSettleTimer: number | null = null;
   private mobileSelectionTimer: number | null = null;
   private darkPages = false;
+  private docIndexPromise: Promise<any> | null = null;
 
   constructor(
     private plugin: Plugin,
@@ -622,6 +623,18 @@ export class NativePdfOverlay {
   ): void {
     target.addEventListener(type, handler, options);
     this.cleanups.push(() => target.removeEventListener(type, handler, options));
+  }
+
+  /** Whole-document text index from OUR pdf.js, for glyph-accurate anchoring
+   * of selections whose DOM rects cannot be trusted (mobile text layer). */
+  private getDocIndex(): Promise<any> {
+    if (!this.docIndexPromise) {
+      this.docIndexPromise = buildDocIndex(this.pdfDoc).catch((e) => {
+        this.docIndexPromise = null;
+        throw e;
+      });
+    }
+    return this.docIndexPromise;
   }
 
   /** Obsidian's internal viewer (documented by community typings): gives the
@@ -1400,7 +1413,29 @@ export class NativePdfOverlay {
     } catch {
       /* context is best-effort */
     }
-    this.pendingSelection = { text, byPage, context };
+    // Obsidian's MOBILE text layer can sit offset from the painted glyphs
+    // (observed on iPad): the DOM selection rects inherit that offset. The
+    // plugin's own pdf.js text geometry is glyph-accurate — re-anchor the
+    // captured text through it and use those rects when they confidently
+    // match, so committed marks land exactly on the words.
+    let finalByPage = byPage;
+    if (Platform.isMobile && this.pdfDoc) {
+      try {
+        const index = await this.getDocIndex();
+        if (this.destroyed) return;
+        const anchoredResults = anchorQuote(index, text, context?.prefix, context?.suffix);
+        if (anchoredResults.length) {
+          const anchored = new Map<number, PdfRect[]>();
+          for (const r of anchoredResults) anchored.set(r.page, r.rects);
+          const overlapsDomPages = [...anchored.keys()].some((page) => byPage.has(page));
+          if (overlapsDomPages) finalByPage = anchored;
+        }
+      } catch (e) {
+        console.warn(`${LOG_TAG} selection re-anchoring failed; keeping DOM rects`, e);
+      }
+    }
+
+    this.pendingSelection = { text, byPage: finalByPage, context };
     // Anchor on the SELECTION, not the pointer: centered under its last line.
     const cx2 = Number.isFinite(selLeft) ? (selLeft + selRight) / 2 : anchorX;
     const cy2 = Number.isFinite(selBottom) ? selBottom : anchorY;
