@@ -1998,3 +1998,141 @@
   background: color-mix(in srgb, var(--lpa-accent, var(--interactive-accent)) 16%, var(--background-primary));
   border-left: 3px solid var(--lpa-accent, var(--interactive-accent));
 }
+
+/* ================= Mobile polish (iPad distortion, iPhone overflow) ====== */
+
+/* Swatches may NEVER stretch: Obsidian's mobile CSS gives toolbar buttons a
+   min-width, which turned our round swatches into ellipses on iPad. Pin every
+   dimension and forbid flex growth. */
+.lpa-swatch {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  aspect-ratio: 1 / 1;
+  padding: 0;
+}
+.lpa-toolbar-swatch {
+  min-width: 18px;
+  max-width: 18px;
+  min-height: 18px;
+  max-height: 18px;
+}
+.is-mobile .lpa-toolbar-swatch {
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  max-width: 26px;
+  min-height: 26px;
+  max-height: 26px;
+}
+.is-mobile .lpa-mark-popover .lpa-swatch,
+.is-mobile .lpa-selection-popover .lpa-swatch {
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  max-width: 30px;
+  min-height: 30px;
+  max-height: 30px;
+}
+.is-mobile .lpa-toolbar-styles .lpa-style-btn {
+  min-width: 34px;
+  max-width: 40px;
+  min-height: 30px;
+  padding: 1px 5px;
+  flex: 0 0 auto;
+}
+
+/* iPhone: the toolbar group scrolls instead of clipping buttons away. */
+.is-mobile .pdf-toolbar .lpa-native-controls {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  justify-content: flex-start;
+  margin: 0 6px;
+  flex: 1 1 auto;
+}
+.is-mobile .pdf-toolbar .lpa-native-controls::-webkit-scrollbar {
+  display: none;
+}
+/* Scrolling makes the style row affordable on phones again (the <900px rule
+   hides it only for narrow DESKTOP panes). */
+.is-mobile .pdf-toolbar .lpa-toolbar-styles {
+  display: flex;
+}
+
+/* ---- Popup polish ------------------------------------------------------- */
+/* Selection popover: calm card, two even rows, consistent round swatches. */
+.is-mobile .lpa-selection-popover {
+  border-radius: 14px;
+  padding: 12px 14px;
+  gap: 10px;
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.4);
+}
+.is-mobile .lpa-selection-popover .lpa-selection-swatches {
+  gap: 9px;
+}
+.is-mobile .lpa-selection-popover .lpa-selection-styles {
+  gap: 6px;
+}
+.is-mobile .lpa-selection-popover .lpa-style-btn,
+.is-mobile .lpa-mark-popover .lpa-style-btn {
+  width: 40px;
+  min-width: 40px;
+  max-width: 40px;
+  min-height: 36px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+}
+
+/* Edit popover / phone modal: even spacing, themed note field, tidy actions. */
+.is-mobile .lpa-native-edit-popover {
+  width: min(360px, calc(100vw - 32px));
+  border-radius: 14px;
+  padding: 14px;
+  gap: 10px;
+}
+.lpa-editor-modal .lpa-styles {
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.lpa-editor-modal .lpa-swatches {
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.lpa-editor-modal .lpa-swatch {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  max-width: 32px;
+  min-height: 32px;
+  max-height: 32px;
+}
+.lpa-editor-modal .lpa-style-btn {
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  min-height: 40px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+}
+.lpa-editor-modal .lpa-native-note {
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  min-height: 96px;
+  font-size: var(--font-ui-medium);
+}
+.lpa-editor-modal .lpa-popover-actions {
+  gap: 10px;
+  margin-top: 4px;
+}
+.lpa-editor-modal .lpa-popover-actions button {
+  flex: 1 1 0;
+  min-height: 42px;
+}
