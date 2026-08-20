@@ -375,6 +375,7 @@ export class NativePdfOverlay {
   private sidebarActive = false;
   private menuObserver: MutationObserver | null = null;
   private sidebarMenuTriggerEl: HTMLElement | null = null;
+  private suppressSidebarViewEvents = 0;
   private toolbarStylesEl: HTMLElement | null = null;
   private tagBtn: HTMLButtonElement | null = null;
   private listBtn: HTMLButtonElement | null = null;
@@ -780,7 +781,10 @@ export class NativePdfOverlay {
     const bus = v?.eventBus;
     if (bus?.on) {
       const onViewChanged = () => {
-        // The user picked Thumbnails/Outline — those own the panel again.
+        // Opening the sidebar ourselves ALSO fires this event (the native
+        // viewer restores its remembered view) — only a real user choice of
+        // Thumbnails/Outline may take the panel back.
+        if (this.suppressSidebarViewEvents > 0) return;
         if (this.sidebarActive) this.setSidebarAnnotationsActive(false);
       };
       bus.on("sidebarviewchanged", onViewChanged);
@@ -921,8 +925,16 @@ export class NativePdfOverlay {
     }
     this.sidebarActive = on;
     if (on) {
-      this.nativeViewer()?.pdfSidebar?.open?.();
-      this.renderListItems();
+      const win = this.contentRoot?.ownerDocument.defaultView ?? window;
+      this.suppressSidebarViewEvents++;
+      try {
+        this.nativeViewer()?.pdfSidebar?.open?.();
+      } finally {
+        win.setTimeout(() => {
+          this.suppressSidebarViewEvents = Math.max(0, this.suppressSidebarViewEvents - 1);
+        }, 150);
+      }
+      if (this.sidebarViewEl) this.renderListItemsInto(this.sidebarViewEl);
     }
     this.sidebarViewEl?.toggleClass("is-active", on);
     this.syncToolbarState();
