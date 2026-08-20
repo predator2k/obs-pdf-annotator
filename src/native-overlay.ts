@@ -84,7 +84,7 @@ import {
 
 /** DOM that belongs to us; mutations inside it must not re-trigger syncing. */
 const OWN_DOM_SELECTOR =
-  ".lpa-native-hl-layer, .lpa-native-note-layer, .lpa-native-roll, .lpa-native-controls, .lpa-native-margins";
+  ".lpa-native-hl-layer, .lpa-native-note-layer, .lpa-native-roll, .lpa-native-controls, .lpa-native-margins, .lpa-sidebar-annotations";
 /** Below this rail width cards are unreadable — skip the side entirely. */
 const RAIL_HIDE_WIDTH = 42;
 /** Keep right-rail cards clear of the native scrollbar. */
@@ -1540,7 +1540,7 @@ export class NativePdfOverlay {
     const target = evt.target as HTMLElement | null;
     if (
       target?.closest(
-        ".pdf-toolbar, .lpa-page-tag, .lpa-native-controls, .lpa-native-roll, .lpa-mark-popover, .lpa-selection-popover, .lpa-native-margins"
+        ".pdf-toolbar, .lpa-page-tag, .lpa-native-controls, .lpa-native-roll, .lpa-mark-popover, .lpa-selection-popover, .lpa-native-margins, .lpa-sidebar-annotations"
       )
     ) {
       return;
@@ -2416,6 +2416,12 @@ export class NativePdfOverlay {
       this.scheduleRailLayout();
     }
     this.syncBindingState();
+    for (const panel of [this.listPanelEl, this.sidebarViewEl]) {
+      if (!panel) continue;
+      for (const item of Array.from(panel.querySelectorAll<HTMLElement>(".lpa-native-roll-item"))) {
+        item.toggleClass("is-active", item.dataset.hlId === next);
+      }
+    }
   }
 
   /** Unpinned tag cards only exist while engaged, so hover/active transitions
@@ -2532,6 +2538,8 @@ export class NativePdfOverlay {
     }
     for (const h of filtered) {
       const item = listEl.createDiv({ cls: "lpa-native-roll-item" });
+      item.dataset.hlId = h.id;
+      item.toggleClass("is-active", h.id === this.activeId);
       item.style.setProperty(
         "--lpa-accent",
         annotationAccent(annotationColor(h))

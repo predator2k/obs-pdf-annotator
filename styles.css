@@ -1992,3 +1992,9 @@
 .menu .lpa-menu-annotations:hover {
   background-color: var(--background-modifier-hover);
 }
+
+/* Selected annotation in the list panels */
+.lpa-native-roll-item.is-active {
+  background: color-mix(in srgb, var(--lpa-accent, var(--interactive-accent)) 16%, var(--background-primary));
+  border-left: 3px solid var(--lpa-accent, var(--interactive-accent));
+}
