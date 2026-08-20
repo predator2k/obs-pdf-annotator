@@ -38,7 +38,11 @@ export function rollPrimaryText(h: Highlight): string {
 export function rollSecondaryText(h: Highlight): string {
   const chunks: string[] = [];
   if (h.note && h.noteContentCJK) chunks.push(h.noteContentCJK);
-  if (annotationTypeOf(h) === "highlight" && h.text) chunks.push(h.text);
+  // The quoted words appear as context only when a NOTE is the primary line;
+  // without one the primary already IS the quote — never show it twice.
+  if (annotationTypeOf(h) === "highlight" && h.text && (h.note || h.noteContentCJK)) {
+    chunks.push(h.text);
+  }
   return shortAnnotationText(chunks.join("  "), 180);
 }
 

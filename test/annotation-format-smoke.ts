@@ -47,6 +47,11 @@ function main(): void {
     "the quoted passage",
     "quoted source shows as secondary when a note exists"
   );
+  assert.equal(
+    rollSecondaryText(mark({})),
+    "",
+    "no note means the primary line is the quote — never repeat it"
+  );
 
   assert.equal(normalizeSearch("  Foo   BAR "), "foo bar");
   assert.ok(annotationMatchesSearch(mark({ note: "Kant on synthesis" }), "kant p.5"));
