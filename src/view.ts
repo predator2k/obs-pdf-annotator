@@ -2438,6 +2438,19 @@ export class PdfAnnotatorView extends FileView {
   }
 
   private onDocumentKeyDown(evt: KeyboardEvent): void {
+    if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeHighlightId) {
+      const target = evt.target as HTMLElement | null;
+      if (
+        !target ||
+        (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA" && !target.isContentEditable)
+      ) {
+        evt.preventDefault();
+        const id = this.activeHighlightId;
+        this.closeMarkPopover();
+        this.deleteAnnotation(id);
+        return;
+      }
+    }
     if ((!evt.metaKey && !evt.ctrlKey) || evt.altKey) return;
     const target = evt.target instanceof Node ? evt.target : null;
     const active = this.contentEl.ownerDocument.activeElement;

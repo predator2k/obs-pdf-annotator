@@ -369,6 +369,12 @@ export class NativePdfOverlay {
   private editPopoverCleanup: (() => void) | null = null;
 
   private toolbarSwatchesEl: HTMLElement | null = null;
+  private fitWidthBtn: HTMLElement | null = null;
+  private sidebarTabBtn: HTMLElement | null = null;
+  private sidebarViewEl: HTMLElement | null = null;
+  private sidebarActive = false;
+  private sidebarActiveToken = "mod-active";
+  private sidebarStrippedEl: HTMLElement | null = null;
   private toolbarStylesEl: HTMLElement | null = null;
   private tagBtn: HTMLButtonElement | null = null;
   private listBtn: HTMLButtonElement | null = null;
@@ -617,10 +623,20 @@ export class NativePdfOverlay {
     this.cleanups.push(() => target.removeEventListener(type, handler, options));
   }
 
+  /** Obsidian's internal viewer (documented by community typings): gives the
+   * pdf.js sidebar, toolbar element refs, and scale control. Everything using
+   * it is defensive — when a future Obsidian changes the shape, features
+   * degrade (floating list panel, no fit-width) instead of breaking. */
+  private nativeViewer(): any {
+    return (this.leaf.view as any)?.viewer?.child?.pdfViewer ?? null;
+  }
+
   // ---- toolbar controls (inside the manager-owned group) -------------------
 
   ensureToolbarButtons(group: HTMLElement): void {
     if (this.destroyed) return;
+    this.ensureFitWidthButton();
+    this.ensureSidebarTab();
     if (this.tagBtn && this.tagBtn.isConnected && this.tagBtn.parentElement === group) {
       this.syncToolbarState();
       return;
@@ -678,12 +694,127 @@ export class NativePdfOverlay {
     this.listBtn.onclick = (evt) => {
       evt.preventDefault();
       evt.stopPropagation();
-      this.toggleListPanel();
+      if (this.ensureSidebarTab()) {
+        this.setSidebarAnnotationsActive(!this.sidebarActive);
+      } else {
+        this.toggleListPanel();
+      }
     };
 
     this.countEl = group.createSpan({ cls: "lpa-native-count", text: "0" });
     this.syncToolbarState();
     this.updateCount();
+  }
+
+  /** "Fit width" beside the native zoom-in control. */
+  private ensureFitWidthButton(): void {
+    if (this.fitWidthBtn?.isConnected) return;
+    this.fitWidthBtn?.remove();
+    this.fitWidthBtn = null;
+    const zoomInEl = this.nativeViewer()?.toolbar?.zoomInEl as HTMLElement | undefined;
+    if (!zoomInEl?.isConnected) return;
+    const btn = zoomInEl.ownerDocument.createElement("button");
+    btn.className = "lpa-native-btn lpa-fit-width-btn clickable-icon";
+    btn.setAttribute("type", "button");
+    btn.setAttribute("aria-label", "Fit page width");
+    btn.setAttribute("title", "Fit page width");
+    setIcon(btn, "move-horizontal");
+    btn.onclick = (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      const raw = this.nativeViewer()?.pdfViewer;
+      if (raw && "currentScaleValue" in raw) raw.currentScaleValue = "page-width";
+    };
+    zoomInEl.insertAdjacentElement("afterend", btn);
+    this.fitWidthBtn = btn;
+  }
+
+  /** Annotations as a third native-sidebar choice beside Thumbnails/Outline.
+   * Returns availability; callers fall back to the floating panel without it. */
+  private ensureSidebarTab(): boolean {
+    if (this.destroyed) return false;
+    if (this.sidebarTabBtn?.isConnected && this.sidebarViewEl?.isConnected) return true;
+    const v = this.nativeViewer();
+    const sidebar = v?.pdfSidebar;
+    const options = v?.toolbar?.sidebarOptionsEl as HTMLElement | undefined;
+    const content = (sidebar?.thumbnailView as HTMLElement | undefined)?.parentElement;
+    if (!sidebar || !options?.isConnected || !content) return false;
+
+    this.sidebarTabBtn?.remove();
+    this.sidebarViewEl?.remove();
+
+    // Mirror the native option buttons: same tag + classes (minus any active
+    // marker, which we also learn here so ours toggles the native way).
+    const sample = options.firstElementChild as HTMLElement | null;
+    for (const token of ["mod-active", "is-active", "active"]) {
+      if (sample?.classList.contains(token) || options.querySelector(`.${token}`)) {
+        this.sidebarActiveToken = token;
+        break;
+      }
+    }
+    const btn = options.ownerDocument.createElement(sample?.tagName.toLowerCase() ?? "button");
+    if (sample) {
+      btn.className = Array.from(sample.classList)
+        .filter((c) => !["mod-active", "is-active", "active"].includes(c))
+        .join(" ");
+    }
+    btn.classList.add("lpa-sidebar-tab");
+    btn.setText("Annotations");
+    btn.setAttribute("aria-label", "Annotations");
+    btn.addEventListener("click", (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      this.setSidebarAnnotationsActive(!this.sidebarActive);
+    });
+    options.appendChild(btn);
+    this.sidebarTabBtn = btn;
+
+    // Our tab view overlays the whole content area; anchor it to the
+    // container even when the native DOM leaves it statically positioned.
+    const win = content.ownerDocument.defaultView ?? window;
+    if (win.getComputedStyle(content).position === "static") {
+      content.style.position = "relative";
+    }
+    const view = content.createDiv({ cls: "lpa-sidebar-annotations" });
+    this.buildListBody(view, false);
+    this.sidebarViewEl = view;
+
+    const bus = v?.eventBus;
+    if (bus?.on) {
+      const onViewChanged = () => {
+        // The user picked Thumbnails/Outline — those own the panel again.
+        if (this.sidebarActive) this.setSidebarAnnotationsActive(false, true);
+      };
+      bus.on("sidebarviewchanged", onViewChanged);
+      this.cleanups.push(() => bus.off?.("sidebarviewchanged", onViewChanged));
+    }
+    if (this.sidebarActive) this.setSidebarAnnotationsActive(true);
+    return true;
+  }
+
+  private setSidebarAnnotationsActive(on: boolean, fromNative = false): void {
+    const v = this.nativeViewer();
+    const sidebar = v?.pdfSidebar;
+    this.sidebarActive = on;
+    const token = this.sidebarActiveToken;
+    if (on) {
+      sidebar?.open?.();
+      // Hand the highlight to our tab; remember whose we took.
+      const options = v?.toolbar?.sidebarOptionsEl as HTMLElement | undefined;
+      const current = options?.querySelector<HTMLElement>(`.${token}`);
+      if (current && current !== this.sidebarTabBtn) {
+        this.sidebarStrippedEl = current;
+        current.classList.remove(token);
+      }
+      this.sidebarTabBtn?.classList.add(token);
+      this.renderListItems();
+    } else {
+      this.sidebarTabBtn?.classList.remove(token);
+      if (!fromNative) this.sidebarStrippedEl?.classList.add(token);
+      this.sidebarStrippedEl = null;
+    }
+    this.sidebarViewEl?.toggleClass("is-active", on);
+    this.syncToolbarState();
   }
 
   private removeToolbarButtons(): void {
@@ -697,6 +828,14 @@ export class NativePdfOverlay {
     this.listBtn = null;
     this.countEl?.remove();
     this.countEl = null;
+    this.fitWidthBtn?.remove();
+    this.fitWidthBtn = null;
+    this.sidebarTabBtn?.remove();
+    this.sidebarTabBtn = null;
+    this.sidebarViewEl?.remove();
+    this.sidebarViewEl = null;
+    this.sidebarActive = false;
+    this.sidebarStrippedEl = null;
   }
 
   private syncToolbarState(): void {
@@ -720,8 +859,9 @@ export class NativePdfOverlay {
     }
     this.tagBtn?.toggleClass("is-active", this.tagMode);
     this.tagBtn?.setAttribute("aria-pressed", this.tagMode ? "true" : "false");
-    this.listBtn?.toggleClass("is-active", !!this.listPanelEl);
-    this.listBtn?.setAttribute("aria-pressed", this.listPanelEl ? "true" : "false");
+    const listOn = !!this.listPanelEl || this.sidebarActive;
+    this.listBtn?.toggleClass("is-active", listOn);
+    this.listBtn?.setAttribute("aria-pressed", listOn ? "true" : "false");
   }
 
   private setTagMode(on: boolean): void {
@@ -739,7 +879,7 @@ export class NativePdfOverlay {
   private notifyStoreChanged(): void {
     this.updateCount();
     this.syncToolbarState();
-    if (this.listPanelEl) this.renderListItems();
+    if (this.listPanelEl || this.sidebarActive) this.renderListItems();
     this.scheduleRailLayout();
   }
 
@@ -1346,6 +1486,24 @@ export class NativePdfOverlay {
   }
 
   private onKeyDown(evt: KeyboardEvent): void {
+    if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeId) {
+      const target = evt.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
+      }
+      evt.preventDefault();
+      const id = this.activeId;
+      const page = this.store?.get(id)?.page;
+      this.closeEditPopover();
+      this.setActiveAnnotation(null);
+      this.store?.remove(id);
+      if (page !== undefined) this.repaintPage(page);
+      this.notifyStoreChanged();
+      return;
+    }
     if (evt.key !== "Escape") return;
     if (this.tagMode) {
       this.setTagMode(false);
@@ -2195,15 +2353,24 @@ export class NativePdfOverlay {
     if (!root || !this.store) return;
     const panel = root.createDiv({ cls: "lpa-native-roll" });
     this.listPanelEl = panel;
+    this.buildListBody(panel, true);
+    this.renderListItems();
+    this.syncToolbarState();
+  }
+
+  /** Search box + list; shared by the floating panel and the sidebar tab. */
+  private buildListBody(panel: HTMLElement, withClose: boolean): void {
     const head = panel.createDiv({ cls: "lpa-native-roll-head" });
     head.createSpan({ cls: "lpa-native-roll-title", text: "Annotations" });
     head.createSpan({ cls: "lpa-native-roll-meta", text: "" });
-    const close = head.createEl("button", {
-      cls: "lpa-native-roll-close",
-      text: "×",
-      attr: { type: "button", "aria-label": "Hide annotations" },
-    });
-    close.onclick = () => this.closeListPanel();
+    if (withClose) {
+      const close = head.createEl("button", {
+        cls: "lpa-native-roll-close",
+        text: "×",
+        attr: { type: "button", "aria-label": "Hide annotations" },
+      });
+      close.onclick = () => this.closeListPanel();
+    }
     const search = panel.createEl("input", {
       cls: "lpa-native-roll-search",
       attr: { type: "search", placeholder: "Search annotations", "aria-label": "Search annotations" },
@@ -2214,8 +2381,6 @@ export class NativePdfOverlay {
       this.renderListItems();
     };
     panel.createDiv({ cls: "lpa-native-roll-list" });
-    this.renderListItems();
-    this.syncToolbarState();
   }
 
   private closeListPanel(): void {
@@ -2225,9 +2390,14 @@ export class NativePdfOverlay {
   }
 
   private renderListItems(): void {
-    const panel = this.listPanelEl;
+    for (const panel of [this.listPanelEl, this.sidebarActive ? this.sidebarViewEl : null]) {
+      if (panel) this.renderListItemsInto(panel);
+    }
+  }
+
+  private renderListItemsInto(panel: HTMLElement): void {
     const store = this.store;
-    if (!panel || !store) return;
+    if (!store) return;
     const listEl = panel.querySelector<HTMLElement>(".lpa-native-roll-list");
     const metaEl = panel.querySelector<HTMLElement>(".lpa-native-roll-meta");
     if (!listEl) return;
