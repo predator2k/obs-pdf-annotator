@@ -61,6 +61,8 @@ interface LpaSettings {
   /** The persistent pen: last used mark color + style. */
   lastColorFill: string | null;
   lastMarkStyle: string | null;
+  /** Toolbar color armed: selections highlight instantly without the popover. */
+  penArmed: boolean;
 }
 
 const DEFAULT_SETTINGS: LpaSettings = {
@@ -73,6 +75,7 @@ const DEFAULT_SETTINGS: LpaSettings = {
   customPalette: null,
   lastColorFill: null,
   lastMarkStyle: null,
+  penArmed: false,
 };
 
 function coerceAnnotationStorageMode(value: string): AnnotationStorageMode {
@@ -394,6 +397,11 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
         this.settings.lastMarkStyle = style;
         void this.saveSettings();
       },
+      getArmed: () => this.settings.penArmed,
+      setArmed: (on: boolean) => {
+        this.settings.penArmed = on;
+        void this.saveSettings();
+      },
     };
   }
 
@@ -485,11 +493,12 @@ class LpaSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Annotate inside the native PDF view (experimental)")
+      .setName("Annotate inside the native PDF view")
       .setDesc(
-        "Adds an “Annotate” toggle to Obsidian's own PDF toolbar. Annotation tools are layered " +
-          "onto the native viewer — its toolbar, sidebar, zoom, and navigation stay untouched. " +
-          "Uses the same sidecar files as the annotator view."
+        "Shows your highlights on Obsidian's own PDF viewer and adds a color/style bar to its " +
+          "toolbar. Pick a color there to highlight selections instantly; with no color armed, " +
+          "selecting text opens the color/style popover. The native toolbar, sidebar, zoom, and " +
+          "navigation stay untouched."
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.enableNativeOverlay).onChange(async (v) => {

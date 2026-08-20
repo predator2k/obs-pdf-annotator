@@ -42,6 +42,8 @@ import {
   activeHighlightBridgeColor,
   activeHighlightGlossColor,
   activeHighlightPaintColor,
+  activeHighlightPaintColorDark,
+  highlightPaintColorDark,
   annotationAccent,
   highlightPaintColor,
   markStrokeColor,
@@ -151,6 +153,8 @@ function nativeViewFile(leaf: WorkspaceLeaf): TFile | null {
  */
 export class NativeOverlayManager {
   private overlays = new Map<WorkspaceLeaf, NativePdfOverlay>();
+  private attaching = new Set<WorkspaceLeaf>();
+  private optedOut = new WeakSet<WorkspaceLeaf>();
   private retryTimer: number | null = null;
   private retryCount = 0;
 
@@ -188,6 +192,11 @@ export class NativeOverlayManager {
     let missingBar = false;
     for (const leaf of leaves) {
       if (!nativeViewFile(leaf)) continue;
+      // Annotation mode is always on: attach as soon as a PDF opens, unless
+      // this leaf was explicitly toggled off.
+      if (!this.overlays.has(leaf) && !this.attaching.has(leaf) && !this.optedOut.has(leaf)) {
+        void this.attach(leaf);
+      }
       if (!this.ensureControls(leaf)) missingBar = true;
     }
     // The native toolbar renders asynchronously after file-open; retry briefly.
@@ -235,13 +244,20 @@ export class NativeOverlayManager {
   async toggle(leaf: WorkspaceLeaf): Promise<void> {
     const existing = this.overlays.get(leaf);
     if (existing) {
+      this.optedOut.add(leaf);
       existing.destroy();
       this.overlays.delete(leaf);
       this.refresh();
       return;
     }
+    this.optedOut.delete(leaf);
+    await this.attach(leaf);
+  }
+
+  private async attach(leaf: WorkspaceLeaf): Promise<void> {
     const file = nativeViewFile(leaf);
-    if (!file) return;
+    if (!file || this.overlays.has(leaf) || this.attaching.has(leaf)) return;
+    this.attaching.add(leaf);
     const overlay = new NativePdfOverlay(
       this.plugin,
       leaf,
@@ -263,6 +279,8 @@ export class NativeOverlayManager {
       }
       overlay.destroy();
       if (this.overlays.get(leaf) === overlay) this.overlays.delete(leaf);
+    } finally {
+      this.attaching.delete(leaf);
     }
     this.refresh();
   }
@@ -274,9 +292,9 @@ export class NativeOverlayManager {
   /** Inject/sync the control group in one native PDF leaf. False if no bar yet. */
   private ensureControls(leaf: WorkspaceLeaf): boolean {
     const container = leaf.view.containerEl;
+    const toolbar = container.querySelector<HTMLElement>(".pdf-toolbar");
     const bar =
-      container.querySelector<HTMLElement>(".pdf-toolbar-right") ??
-      container.querySelector<HTMLElement>(".pdf-toolbar") ??
+      toolbar ??
       container.querySelector<HTMLElement>(".view-header .view-actions, .view-actions");
     if (!bar) return false;
 
@@ -292,35 +310,17 @@ export class NativeOverlayManager {
     if (!group) {
       group = bar.ownerDocument.createElement("div");
       group.className = "lpa-native-controls";
-      if (bar.hasClass("view-actions")) bar.insertBefore(group, bar.firstChild);
-      else bar.appendChild(group);
-
-      const toggle = group.createEl("button", {
-        cls: "lpa-native-toggle clickable-icon",
-        attr: { type: "button" },
-      });
-      setIcon(toggle, "highlighter");
-      toggle.createSpan({ cls: "lpa-native-toggle-label", text: "Annotate" });
-      toggle.onclick = (evt) => {
-        evt.preventDefault();
-        evt.stopPropagation();
-        void this.toggle(leaf);
-      };
+      if (toolbar) {
+        // Centered between the native left and right toolbar sections.
+        const right = toolbar.querySelector<HTMLElement>(".pdf-toolbar-right");
+        if (right) toolbar.insertBefore(group, right);
+        else toolbar.appendChild(group);
+      } else {
+        bar.insertBefore(group, bar.firstChild);
+      }
     }
 
-    const overlay = this.overlays.get(leaf) ?? null;
-    const toggle = group.querySelector<HTMLElement>(".lpa-native-toggle");
-    if (toggle) {
-      const on = !!overlay;
-      toggle.toggleClass("is-active", on);
-      toggle.setAttribute("aria-pressed", on ? "true" : "false");
-      const label = on
-        ? "Annotation mode is on. Click to turn it off."
-        : "Annotate this PDF in place (keeps the native viewer)";
-      toggle.setAttribute("aria-label", label);
-      toggle.setAttribute("title", label);
-    }
-    overlay?.ensureToolbarButtons(group);
+    this.overlays.get(leaf)?.ensureToolbarButtons(group);
     return true;
   }
 
@@ -368,6 +368,8 @@ export class NativePdfOverlay {
   private selectionPopoverEl: HTMLElement | null = null;
   private editPopoverCleanup: (() => void) | null = null;
 
+  private toolbarSwatchesEl: HTMLElement | null = null;
+  private toolbarStylesEl: HTMLElement | null = null;
   private tagBtn: HTMLButtonElement | null = null;
   private listBtn: HTMLButtonElement | null = null;
   private countEl: HTMLElement | null = null;
@@ -392,6 +394,7 @@ export class NativePdfOverlay {
   private hoverClearTimer: number | null = null;
   private scrollSettleTimer: number | null = null;
   private mobileSelectionTimer: number | null = null;
+  private darkPages = false;
 
   constructor(
     private plugin: Plugin,
@@ -573,6 +576,7 @@ export class NativePdfOverlay {
     this.connectionSvg = null;
     this.scroller = null;
 
+    this.contentRoot?.removeClass("lpa-dark-pages");
     this.contentRoot
       ?.querySelectorAll<HTMLElement>(
         ".lpa-native-hl-layer, .lpa-native-note-layer, .lpa-native-margins"
@@ -623,6 +627,38 @@ export class NativePdfOverlay {
     }
     this.removeToolbarButtons();
 
+    // Colors: click to ARM (selections then highlight instantly); click the
+    // armed color again to disarm and get the popover-on-selection flow back.
+    this.toolbarSwatchesEl = group.createDiv({ cls: "lpa-toolbar-swatches" });
+    for (const p of PALETTE) {
+      const sw = this.toolbarSwatchesEl.createEl("button", {
+        cls: "lpa-swatch lpa-toolbar-swatch",
+        attr: { type: "button", "aria-label": p.name, title: `${p.name} — click to highlight selections instantly` },
+      });
+      sw.setCssProps({ background: p.fill });
+      sw.dataset.color = p.fill;
+      sw.onclick = (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        const armedHere = this.pen?.getArmed() && this.currentColor === p.fill;
+        this.currentColor = p.fill;
+        this.pen?.set(this.currentColor, this.currentStyle);
+        this.pen?.setArmed(!armedHere);
+        this.syncToolbarState();
+      };
+    }
+
+    this.toolbarStylesEl = group.createDiv({ cls: "lpa-toolbar-styles" });
+    buildSelectionStyleRow(
+      this.toolbarStylesEl,
+      () => this.currentStyle,
+      () => this.currentColor,
+      (st) => {
+        this.currentStyle = st;
+        this.pen?.set(this.currentColor, this.currentStyle);
+      }
+    );
+
     this.tagBtn = group.createEl("button", {
       cls: "lpa-native-btn clickable-icon",
       attr: { type: "button", "aria-label": "Place a page note tag", title: "Place a page note tag" },
@@ -651,6 +687,10 @@ export class NativePdfOverlay {
   }
 
   private removeToolbarButtons(): void {
+    this.toolbarSwatchesEl?.remove();
+    this.toolbarSwatchesEl = null;
+    this.toolbarStylesEl?.remove();
+    this.toolbarStylesEl = null;
     this.tagBtn?.remove();
     this.tagBtn = null;
     this.listBtn?.remove();
@@ -660,6 +700,24 @@ export class NativePdfOverlay {
   }
 
   private syncToolbarState(): void {
+    const armed = !!this.pen?.getArmed();
+    if (this.toolbarSwatchesEl) {
+      for (const sw of Array.from(this.toolbarSwatchesEl.children) as HTMLElement[]) {
+        const isCurrent = sw.dataset.color === this.currentColor;
+        sw.toggleClass("is-active", isCurrent);
+        sw.toggleClass("is-armed", armed && isCurrent);
+        sw.setAttribute("aria-pressed", armed && isCurrent ? "true" : "false");
+      }
+    }
+    if (this.toolbarStylesEl) {
+      for (const b of Array.from(
+        this.toolbarStylesEl.querySelectorAll<HTMLElement>(".lpa-style-btn")
+      )) {
+        b.toggleClass("is-active", b.dataset.style === this.currentStyle);
+        b.style.setProperty("--lpa-ink", markStrokeColor(this.currentColor));
+        b.style.setProperty("--lpa-fill", resolvePalette(this.currentColor)?.fill ?? this.currentColor);
+      }
+    }
     this.tagBtn?.toggleClass("is-active", this.tagMode);
     this.tagBtn?.setAttribute("aria-pressed", this.tagMode ? "true" : "false");
     this.listBtn?.toggleClass("is-active", !!this.listPanelEl);
@@ -680,6 +738,7 @@ export class NativePdfOverlay {
 
   private notifyStoreChanged(): void {
     this.updateCount();
+    this.syncToolbarState();
     if (this.listPanelEl) this.renderListItems();
     this.scheduleRailLayout();
   }
@@ -707,6 +766,7 @@ export class NativePdfOverlay {
 
   private syncPages(): void {
     if (this.destroyed || !this.contentRoot || !this.store) return;
+    this.updateDarkPageState();
     const store = this.store;
     const pageEls = this.contentRoot.querySelectorAll<HTMLElement>(".page[data-page-number]");
     for (const pageEl of Array.from(pageEls)) {
@@ -722,6 +782,21 @@ export class NativePdfOverlay {
       void this.syncPage(idx, pageEl);
     }
     this.scheduleRailLayout();
+  }
+
+  /** CSS snippets that invert the canvas (dark PDF pages) break multiply
+   * blending — everything goes muddy. Detect the inversion on the live canvas
+   * and let the stylesheet switch the highlight layers to screen blending. */
+  private updateDarkPageState(): void {
+    const root = this.contentRoot;
+    if (!root) return;
+    const canvas = root.querySelector<HTMLElement>(".canvasWrapper canvas");
+    const filter = canvas ? (canvas.ownerDocument.defaultView ?? window).getComputedStyle(canvas).filter : "";
+    const inverted = filter.includes("invert");
+    if (inverted !== this.darkPages) {
+      this.darkPages = inverted;
+      root.toggleClass("lpa-dark-pages", inverted);
+    }
   }
 
   private async syncPage(idx: number, pageEl: HTMLElement): Promise<void> {
@@ -823,6 +898,8 @@ export class NativePdfOverlay {
       div.style.setProperty("--lpa-hl-color-active", activeHighlightPaintColor(r.color));
       div.style.setProperty("--lpa-hl-color-active-gloss", activeHighlightGlossColor(r.color));
       div.style.setProperty("--lpa-hl-color-active-bridge", activeHighlightBridgeColor(r.color));
+      div.style.setProperty("--lpa-hl-color-dark", highlightPaintColorDark(r.color));
+      div.style.setProperty("--lpa-hl-color-active-dark", activeHighlightPaintColorDark(r.color));
       const ids = Array.from(r.ids);
       div.dataset.hlIds = ids.join(" ");
       if (ids.length === 1) div.dataset.hlId = ids[0];
@@ -862,6 +939,7 @@ export class NativePdfOverlay {
     el.style.setProperty("--lpa-hl-color-active", activeHighlightPaintColor(h.color));
     el.style.setProperty("--lpa-hl-color-active-gloss", activeHighlightGlossColor(h.color));
     el.style.setProperty("--lpa-hl-color-active-bridge", activeHighlightBridgeColor(h.color));
+    el.style.setProperty("--lpa-hl-color-active-dark", activeHighlightPaintColorDark(h.color));
     if (st === "dashed") {
       el.style.setProperty(
         "--lpa-deco",
@@ -1053,6 +1131,13 @@ export class NativePdfOverlay {
       /* context is best-effort */
     }
     this.pendingSelection = { text, byPage, context };
+    if (this.pen?.getArmed()) {
+      // A toolbar color is armed: the selection IS the highlight.
+      this.currentColor = this.pen.getColor();
+      this.currentStyle = this.pen.getStyle();
+      this.commitSelection("highlight", anchorX, anchorY);
+      return;
+    }
     this.showSelectionPopover(anchorX, anchorY);
   }
 

@@ -3,8 +3,9 @@
 Read a PDF, mark the parts that matter, and keep your own thoughts beside the
 words — all inside Obsidian, on desktop and mobile.
 
-Open any PDF and click **Annotate**. You can highlight a sentence, write a
-note, and carry on reading without changing apps or opening a second document.
+Open any PDF — your highlights are right there, and a color bar sits in the
+toolbar. Pick a color, select a sentence, and it's highlighted; click it to
+write a note, and carry on reading without changing apps.
 
 ## Mark what matters
 
@@ -19,6 +20,11 @@ Select some words and choose what you want to do:
 Pick the mark style right in the popover: plain highlight, underline, dotted
 underline, dashed underline, box, or strike-through. Your last style and color
 are remembered — set your pen once and keep reading.
+
+Prefer zero clicks? **Arm a color in the toolbar** (click one of the swatches
+between the native controls): from then on, selecting text highlights it
+instantly with your current style — no popover. Click the armed swatch again
+to disarm and get the popover flow back.
 
 ## Notes live in a popup
 
@@ -96,13 +102,13 @@ resize changes.
 
 ### Native PDF workflow
 
-1. Open a PDF normally in Obsidian.
-2. Click **Annotate** in the native PDF toolbar.
-3. Select text, pick a style/color if you like, and choose **Highlight**,
-   **Annotate**, or **Copy**.
-4. Click an existing mark to edit its style, colour, note, or side note in the
-   popup; right-click for the menu (copy link, delete, card placement).
-5. Use the in-PDF list or the sidebar panel for search and navigation.
+1. Open a PDF normally in Obsidian — annotation mode attaches automatically
+   (toggle it off per-PDF with the command palette if you want a plain viewer).
+2. Select text: with a toolbar color armed the highlight applies instantly;
+   otherwise the color/style popover appears and a color click commits.
+3. Click an existing mark to edit its style, colour, or note in the popup;
+   right-click for the menu (copy link, delete, card placement).
+4. Use the in-PDF list or the sidebar panel for search and navigation.
 
 ### Highlight links
 

@@ -15,12 +15,7 @@ import {
   type Highlight,
   type MarkStyle,
 } from "./annotations";
-import {
-  annotationColor,
-  annotationTypeOf,
-  shortAnnotationText,
-  tagPreview,
-} from "./annotation-format";
+import { annotationColor, annotationTypeOf, tagPreview } from "./annotation-format";
 
 /**
  * Compact style row for the pre-commit selection popovers: pick underline /
@@ -211,10 +206,6 @@ function buildEditorContent(
     };
   }
   syncColorChecks();
-
-  if (type === "highlight" && initial.text) {
-    container.createDiv({ cls: "lpa-native-popover-source", text: shortAnnotationText(initial.text, 160) });
-  }
 
   const note = container.createEl("textarea", {
     cls: "lpa-native-note",

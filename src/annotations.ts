@@ -115,6 +115,9 @@ export interface PenState {
   getColor(): string;
   getStyle(): MarkStyle;
   set(color: string, style: MarkStyle): void;
+  /** Armed: a toolbar color is engaged — selections commit instantly. */
+  getArmed(): boolean;
+  setArmed(on: boolean): void;
 }
 
 /**
@@ -211,6 +214,25 @@ export function activeHighlightBridgeColor(color: string): string {
   // Inter-line connector. Lighter than the text band, but present enough that
   // a multi-line passage reads as one continuous chunk of ink.
   const a = clampCssAlpha(activeHighlightAlpha(c) * 0.5);
+  return `rgba(${c.r}, ${c.g}, ${c.b}, ${a})`;
+}
+
+/**
+ * DARK-PAGE variants: when the native canvas is inverted to a dark page (CSS
+ * snippets like invert(1) hue-rotate(180deg)), the layer switches from
+ * multiply to screen blending — denser alpha keeps the band readable there.
+ */
+export function highlightPaintColorDark(color: string): string {
+  const c = highlightBaseColor(color);
+  if (!c) return highlightPaintColor(color);
+  const a = clampCssAlpha(Math.min(0.85, c.a + 0.28));
+  return `rgba(${c.r}, ${c.g}, ${c.b}, ${a})`;
+}
+
+export function activeHighlightPaintColorDark(color: string): string {
+  const c = highlightBaseColor(color);
+  if (!c) return highlightPaintColor(color);
+  const a = clampCssAlpha(Math.min(0.95, activeHighlightAlpha(c) + 0.15));
   return `rgba(${c.r}, ${c.g}, ${c.b}, ${a})`;
 }
 

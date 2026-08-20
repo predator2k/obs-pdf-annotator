@@ -1835,3 +1835,108 @@
 .theme-dark .lpa-style-sample {
   color: var(--text-normal);
 }
+
+/* ---- Dark PDF pages (inverted canvas via CSS snippet) -------------------- */
+/* Detected in JS (canvas filter contains invert → .lpa-dark-pages on the
+   view content). Multiply blending darkens into mud on a dark page, so the
+   whole layer flips to screen: fills become luminous color bands and strokes
+   glow in their saturated hue, while the light glyphs stay readable (screen
+   never darkens them). Denser dark-tuned alphas keep the bands punchy. */
+.lpa-dark-pages .lpa-highlight-layer {
+  mix-blend-mode: screen;
+}
+.lpa-dark-pages .lpa-highlight {
+  background: var(--lpa-hl-color-dark, var(--lpa-hl-color, rgba(255, 212, 0, 0.74)));
+}
+.lpa-dark-pages .lpa-highlight.is-hover,
+.lpa-dark-pages .lpa-highlight.is-active {
+  background: var(--lpa-hl-color-active-dark, var(--lpa-hl-color-active));
+}
+.lpa-dark-pages .lpa-highlight.is-hover.lpa-run-first:not(.lpa-run-single)::before,
+.lpa-dark-pages .lpa-highlight.is-active.lpa-run-first:not(.lpa-run-single)::before,
+.lpa-dark-pages .lpa-highlight.is-hover.lpa-run-middle::before,
+.lpa-dark-pages .lpa-highlight.is-active.lpa-run-middle::before,
+.lpa-dark-pages .lpa-highlight.is-hover.lpa-run-last::before,
+.lpa-dark-pages .lpa-highlight.is-active.lpa-run-last::before {
+  background: color-mix(
+    in srgb,
+    var(--lpa-hl-color-active-dark, var(--lpa-hl-color-active)) 55%,
+    transparent
+  );
+}
+/* Decorative marks (underline/box/strike…): keep the stroke saturated; the
+   engaged wash uses the denser dark tone at reduced weight. */
+.lpa-dark-pages .lpa-highlight.lpa-mark {
+  background: transparent;
+}
+.lpa-dark-pages .lpa-highlight.lpa-mark.is-hover,
+.lpa-dark-pages .lpa-highlight.lpa-mark.is-active {
+  background: color-mix(
+    in srgb,
+    var(--lpa-hl-color-active-dark, var(--lpa-hl-color-active)) 65%,
+    transparent
+  );
+}
+
+/* ---- Native toolbar annotation bar -------------------------------------- */
+/* The controls group sits between the native toolbar's left and right
+   sections; margin auto centers it in the remaining space. */
+.pdf-toolbar .lpa-native-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.lpa-toolbar-swatches {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+.lpa-toolbar-swatch {
+  width: 18px;
+  height: 18px;
+  transition: transform 90ms ease, box-shadow 90ms ease;
+}
+.lpa-toolbar-swatch.is-armed {
+  transform: scale(1.15);
+  box-shadow:
+    0 0 0 2px var(--background-primary),
+    0 0 0 4px var(--interactive-accent);
+}
+.lpa-toolbar-styles {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.lpa-toolbar-styles .lpa-selection-styles {
+  margin: 0;
+  gap: 2px;
+  flex-wrap: nowrap;
+}
+.lpa-toolbar-styles .lpa-style-btn {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 1px 4px;
+}
+/* Tight toolbars (narrow panes): let the style row shrink away first. */
+@media (max-width: 900px) {
+  .pdf-toolbar .lpa-toolbar-styles {
+    display: none;
+  }
+}
+
+/* ---- Bigger page-note tags ---------------------------------------------- */
+.lpa-page-tag {
+  min-height: 26px;
+  max-width: 160px;
+  padding: 4px 10px;
+  gap: 6px;
+  font-size: var(--font-ui-small);
+}
+.lpa-tag-dot {
+  width: 9px;
+  height: 9px;
+}
