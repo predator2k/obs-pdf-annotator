@@ -4,6 +4,6 @@
   "version": "0.3.0",
   "minAppVersion": "1.8.10",
   "description": "Read and annotate PDFs with path-independent Markdown annotations and verified vault-local recovery bundles.",
-  "author": "Alexander Tian",
+  "author": "",
   "isDesktopOnly": false
 }
