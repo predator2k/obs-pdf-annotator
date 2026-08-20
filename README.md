@@ -1,188 +1,168 @@
 # PDF Annotator
 
 Read a PDF, mark the parts that matter, and keep your own thoughts beside the
-words — all inside Obsidian.
+words — all inside Obsidian, on desktop and mobile.
 
-Open any PDF and click **Annotate**. You can highlight a sentence, write a note,
-and carry on reading without changing apps or opening a second document.
-
-![A PDF page with several short and long notes on both sides](docs/screenshots/annotation-cards-overview-light-retina.png)
-
-*Your notes stay close to the words they belong to.*
-
-## See every note beside the page
-
-Notes appear on the left or right of the page. A short note stays small. A long
-note is taller, so you can tell how much you wrote before opening it.
-
-When one page has many long notes, the cards fold just enough to share the
-space. A soft fade and **…** show that more words are waiting. Point to a card or
-click it to see the whole note.
-
-![Short, medium, and long cards with a gentle folded ending](docs/screenshots/annotation-card-folding-detail-light-retina.png)
-
-*Different note lengths are easy to spot, and folded notes clearly show that
-there is more to read.*
-
-You do not need to guess how to make room for the cards. After you make a note,
-or choose one from the note list, the PDF moves back just enough to show its
-card. It stops as soon as the card has enough space.
+Open any PDF and click **Annotate**. You can highlight a sentence, write a
+note, and carry on reading without changing apps or opening a second document.
 
 ## Mark what matters
 
 Select some words and choose what you want to do:
 
 - **Highlight** marks the words.
-- **Annotate** marks the words and opens a place to write.
+- **Annotate** marks the words and opens a note editor.
 - **Copy** copies the selected words.
 
 ![Simple buttons for highlighting, annotating, or copying selected words](docs/screenshots/selection-popover-light-retina.png)
 
-You can use a plain highlight, underline, dotted underline, dashed underline,
-box, or strike-through. Four colours help different kinds of thought stand
-apart.
+Pick the mark style right in the popover: plain highlight, underline, dotted
+underline, dashed underline, box, or strike-through. Your last style and color
+are remembered — set your pen once and keep reading.
 
-## Open one note fully
+## Notes live in a popup
 
-Point to a note or click it and the card opens to show everything you wrote. A
-long note is not cut off. Click the pin when you want a card to stay open.
+Notes come in two forms:
 
-![A long selected note opened to its full height beside the PDF](docs/screenshots/annotation-card-expanded-light-retina.png)
+- **Attached to a highlight** — choose **Annotate** after selecting text, or
+  click an existing mark and write in its popup.
+- **Free-form page notes** — click the tag button in the toolbar, then click
+  anywhere on the page. The note is anchored to that exact position, no text
+  selection needed.
 
-*The selected note opens fully while the other cards stay out of the way.*
+Click any mark or page note to open its editor. The popup shows the quoted
+words (for highlights), and lets you change the style, change the color, write
+a note, copy the text, copy a link, or delete it. Nothing moves on the page and
+the zoom level never changes.
+
+On phones the same editor opens as a sheet, sized for thumbs.
+
+## Cite a highlight in your notes
+
+Right-click a mark (or use the **Copy link** button in the popup) to copy a
+markdown link like:
+
+```text
+[[paper.pdf#page=5&selection=12,0,14,7|paper, p.5]]
+```
+
+Paste it into any note. Clicking it scrolls to the page and flashes the exact
+words — using Obsidian's own PDF link format, so the link keeps working even
+if this plugin is disabled. When the exact words cannot be located (scanned or
+unusual PDFs), the link points at the page instead.
+
+Free-form page notes are linkable too: their links use Obsidian's native
+scroll-destination form (`#page=N&offset=x,y,0`), which jumps to the note's
+exact position on the page.
 
 ## Find a note again
 
-Click the list button beside **Annotate** to see every mark and note in the PDF.
-Search for a word, a page, or something you wrote. Click any result to go back
-to its page and show its card.
+- **In the PDF**: click the list button beside **Annotate** for a searchable
+  list of every mark and note. Click a result to jump to it.
+- **In the sidebar**: run **Open annotations panel** for a workspace panel that
+  always shows the highlights of the PDF you are reading, with search. It works
+  with both viewing modes and stays put while you write in other notes.
 
 ![The searchable list of notes beside the PDF](docs/screenshots/annotation-list-light-retina.png)
 
-## Put notes where you want them
+## Your own colors
 
-Right-click any card to keep it open, move it to the left, move it to the right,
-let PDF Annotator choose a side, or delete it.
+Add, rename, or remove highlight colors in the plugin settings with a color
+picker. Existing marks always keep the color they were made with, even if you
+later remove it from the palette.
 
-![The right-click menu for pinning, moving, or deleting a note](docs/screenshots/annotation-card-menu-light-retina.png)
+## Margin note cards (optional)
 
-*Moving a card never moves or changes the words you marked.*
+If you prefer notes laid out beside the page, enable **Show margin note cards**
+in settings. Cards appear in whatever margin space already exists — the plugin
+never zooms the page out to make room. Short notes stay small, long notes fold
+gently, and hovering or selecting a card expands it.
 
-## A simple reading routine
-
-1. Open a PDF and click **Annotate**.
-2. Select a useful sentence.
-3. Choose **Highlight** or **Annotate**.
-4. Write your thought.
-5. Keep reading; your note stays beside the page.
-6. Use the list when you want to find it again.
+![A PDF page with several short and long notes on both sides](docs/screenshots/annotation-cards-overview-light-retina.png)
 
 ---
 
 ## Technical Notes
 
-PDF Annotator is a desktop-only Obsidian community plugin. It adds annotation
-layers, controls, margin rails, and an annotation list to Obsidian's native PDF
-viewer. Obsidian's existing toolbar, outline/sidebar, zoom controls, and page
-navigation remain in place.
+PDF Annotator is an Obsidian community plugin for desktop and mobile. Its main
+mode adds annotation layers, controls, and an annotation list to Obsidian's
+native PDF viewer; the native toolbar, outline/sidebar, zoom, and page
+navigation remain in place and are never driven programmatically.
 
 Selection alone does not create an annotation. The selection popover commits a
-highlight or annotated mark only after the user chooses an action. Highlight
-geometry is stored in PDF user-space coordinates, so marks stay anchored across
-zoom and resize changes.
-
-### Automatic rail space
-
-Creating an annotation or selecting one from the annotation list activates its
-card. If the native PDF page leaves too little readable margin, the plugin uses
-the native zoom-out control until that card's rail is wide enough. It stops as
-soon as the target rail is readable and has a bounded retry limit.
-
-Resting card height is weighted mainly by user-written content. On a dense page,
-the available rail height is shared proportionally: longer cards remain visibly
-longer, while all resting cards fold enough to fit. Hovered, active, and pinned
-cards expand to their full content height, with an internal scrollbar only when
-the entire card is taller than the available viewport.
+highlight or annotated mark only after you choose an action. Highlight geometry
+is stored in PDF user-space coordinates, so marks stay anchored across zoom and
+resize changes.
 
 ### Native PDF workflow
 
 1. Open a PDF normally in Obsidian.
 2. Click **Annotate** in the native PDF toolbar.
-3. Select text and choose **Highlight**, **Annotate**, or **Copy**.
-4. Click an existing mark to edit its style, colour, note, or side note.
-5. Use a side card for in-place editing, or the annotation list for search and
-   navigation.
+3. Select text, pick a style/color if you like, and choose **Highlight**,
+   **Annotate**, or **Copy**.
+4. Click an existing mark to edit its style, colour, note, or side note in the
+   popup; right-click for the menu (copy link, delete, card placement).
+5. Use the in-PDF list or the sidebar panel for search and navigation.
 
-The card context menu supports pin/unpin, left placement, right placement,
-automatic placement, and deletion. Drag-and-drop between rails is not currently
-implemented.
+### Highlight links
 
-## Fallback Annotator View
+**Copy link** produces Obsidian-native subpaths
+(`#page=N&selection=beginIndex,beginOffset,endIndex,endOffset`). In the native
+viewer the selection indices are read from the rendered text layer (exact by
+construction), so copy the link while the page is on screen; if the page is
+not rendered — or no confident text match exists — the link degrades to
+`#page=N` rather than pointing at the wrong words.
 
-The original bundled `pdf.js` annotator view remains available as a stable
-fallback. Use the command palette action:
+## Storage
 
-```text
-Open current PDF in annotator
-```
+Annotations are stored in a human-readable Markdown sidecar per PDF. The
+sidecar has a readable summary plus a fenced JSON block that is the
+machine-readable source of truth. A rolling `*.annotations.previous.md`
+last-known-good copy protects against interrupted or corrupted saves. The
+working PDF itself is never modified.
 
-You can also make the fallback annotator the default PDF viewer from plugin
-settings. This redirects ordinary `.pdf` clicks into PDF Annotator. The setting
-is opt-in for fresh installs.
+**How a PDF is matched to its annotations** is configurable:
 
-## Storage and Recovery
+- **File path** (default): the sidecar lives in the annotation folder,
+  mirroring the PDF's vault path — `Books/Novel.pdf` →
+  `PDF annotations/Books/Novel.annotations.md`. Opening is fast (no hashing in
+  fresh vaults; vaults upgraded from 0.2.x hash once per open while old bundle
+  data remains, to keep migrations safe), annotations survive edits to the
+  PDF's contents, and renaming or moving the PDF inside Obsidian moves the
+  sidecar along automatically. Moving the file outside Obsidian leaves the
+  sidecar behind (it can be re-attached via the fingerprint match on first
+  open).
+- **Content hash**: the SHA-256 of the PDF bytes is the identity, with the
+  sidecar stored under `.pdf-annotator/bundles/sha256/<hash>/`. Robust against
+  moves and renames done outside Obsidian, but an edited PDF counts as a new
+  document, and every open reads and hashes the whole file.
 
-The visible PDF path is not the document identity. Identity comes from a SHA-256
-hash of the PDF bytes, and the canonical vault-local bundle is stored at:
-
-```text
-.pdf-annotator/bundles/sha256/<hash>/
-  document.pdf
-  annotations.md
-  annotations.previous.md
-  manifest.json
-```
-
-`document.pdf` is a verified byte-for-byte recovery copy. `annotations.md` is
-the canonical annotation sidecar, and `annotations.previous.md` is a rolling
-last-known-good copy used if a save is interrupted or corrupted.
-`manifest.json` records the current working path, previous path aliases,
-checksum, original filename, timestamps, and PDF fingerprint. The working PDF
-is never modified.
-
-The bundle is created the first time annotation mode opens for that PDF. This
-uses roughly one additional PDF's worth of vault storage in exchange for
-deletion recovery.
-
-Moving or renaming a working PDF does not move the bundle and cannot disconnect
-its annotations. Replacing a PDF with different bytes at the same path creates a
-different bundle, so annotations cannot silently attach to the wrong document.
-Deleting the working copy leaves the bundle intact. Use **Restore a PDF from
-annotation backup** in the command palette to verify the checksum and restore a
-copy into `Recovered PDFs/`.
-
-Existing central or same-folder `<pdf-name>.annotations.md` sidecars are
-imported on first open. A unique PDF-fingerprint match can also recover a
-sidecar that was already orphaned by a rename. Legacy files are retained as
+Annotations created under one mode are found and migrated automatically when
+you switch modes or upgrade from an older release; legacy files are retained as
 recovery snapshots.
 
-The canonical sidecar contains a readable Markdown summary and a fenced JSON
-block that is used as the machine-readable source of truth. Use **Export
-annotations for current PDF** to create a user-visible snapshot under
-`PDF annotations/Exports/` (or the configured legacy annotation folder).
+### Retired: stored PDF copies
 
-Use **Verify all PDF annotation backups** to checksum every managed recovery
-copy. Backups are also verified when created and periodically when their PDFs
-are opened. The managed library protects against moving, renaming, replacing,
-or deleting a working copy; it is still part of the same vault, so the vault
-itself should remain covered by iCloud, Obsidian Sync, or another backup system.
-If your sync tool excludes hidden folders, explicitly include
-`.pdf-annotator/`.
+Versions up to 0.2.x kept a byte-for-byte recovery copy of every annotated PDF
+inside `.pdf-annotator/`. This doubled the storage cost per document and has
+been retired: no new copies are written, leftover copies are deleted
+automatically the next time each PDF is opened, and the
+**Delete stored PDF copies** command reclaims the rest in one go. The plugin
+never deletes or modifies your working PDFs — keep your vault covered by
+iCloud, Obsidian Sync, or another backup system as usual.
+
+## Mobile
+
+The plugin runs on iOS, iPadOS, and Android (Obsidian 1.8.10 or newer). The
+native-viewer annotation mode is the mobile experience: select text with the
+system grabbers, then use the popover; tap a mark to edit it in a sheet.
+Tag dragging and hover previews are desktop-only.
 
 ## Privacy
 
 PDF Annotator does not use telemetry and does not send PDF contents or
-annotation contents to any remote service. Data is stored locally in your vault.
+annotation contents to any remote service. Data is stored locally in your
+vault.
 
 ## Legacy Import
 
@@ -197,20 +177,47 @@ The importer searches notes with `annotation-target:` frontmatter, re-anchors
 quoted text in the PDF, and creates PDF Annotator highlights. Legacy notes are
 left untouched.
 
+## Fallback Annotator View
+
+The original bundled `pdf.js` annotator view remains available as a stable
+fallback (desktop). Use the command palette action:
+
+```text
+Open current PDF in annotator
+```
+
+You can also make the fallback annotator the default PDF viewer from plugin
+settings (desktop only). This redirects ordinary `.pdf` clicks into
+PDF Annotator.
+
+## Commands
+
+- **Toggle annotation mode on the native PDF view**
+- **Open annotations panel**
+- **Export annotations for current PDF** — snapshot under
+  `PDF annotations/Exports/`
+- **Delete stored PDF copies (reclaim space)** — removes 0.2.x-era duplicates
+  (copies whose PDF no longer exists anywhere in the vault are kept, since they
+  are the only surviving copy of that document)
+- **Import legacy obsidian-annotator highlights for this PDF**
+- **Open current PDF in annotator** — the fallback custom view
+
 ## Development
 
 ```bash
 npm install
 npm run typecheck
+npm test
 npm run build
 ```
 
-`npm run build` type-checks the plugin, bundles `main.js`, and copies `main.js`,
-`manifest.json`, and `styles.css` into the configured local vault plugin
-directory used by this checkout.
+`npm run build` type-checks the plugin, bundles `main.js`, and copies
+`main.js`, `manifest.json`, and `styles.css` into
+`LOCAL_PDF_ANNOTATOR_PLUGIN_DIR` (or `./dist` when unset). Point that variable
+at a vault's `.obsidian/plugins/local-pdf-annotator/` to test in Obsidian.
 
-Set `LOCAL_PDF_ANNOTATOR_PLUGIN_DIR` to build into a staging directory without
-touching the installed Obsidian copy.
+The plugin bundles its own pinned pdf.js and worker (inlined as a Blob URL) so
+it can never conflict with Obsidian's internal pdf.js version.
 
 ## Release Files
 

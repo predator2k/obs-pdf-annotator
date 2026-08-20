@@ -19,9 +19,8 @@
  *  - Margin note cards (the custom view's side-annotation UX) live in a
  *    ".lpa-native-margins" overlay pinned to the native scroller's box: cards
  *    are anchored beside the visible pages and re-laid-out on scroll, resize,
- *    zoom, and native re-renders. When an active annotation has no readable
- *    rail, the overlay clicks native zoom-out instead of drawing cards over the
- *    page.
+ *    zoom, and native re-renders. Cards only use margin space that already
+ *    exists — the overlay never changes the native zoom level itself.
  *  - Everything injected is namespaced "lpa-native-*" and removed when the
  *    mode is toggled off, the leaf changes file or closes, or the plugin
  *    unloads.
@@ -31,27 +30,48 @@
  * painting/creating marks is skipped on aspect-mismatched pages instead of
  * placing them wrong.
  */
-import { App, Menu, Notice, Plugin, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, Menu, Notice, Platform, Plugin, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import { pdfjsLib, initPdfEngine, createDedicatedWorker, LOG_TAG } from "./pdf-engine";
 import {
   AnnotationStore,
-  DEFAULT_COLOR,
+  defaultColor,
   PALETTE,
   resolvePalette,
   MARK_STYLES,
   MARK_STYLE_LABELS,
+  activeHighlightBridgeColor,
+  activeHighlightGlossColor,
+  activeHighlightPaintColor,
+  annotationAccent,
+  highlightPaintColor,
+  markStrokeColor,
   markStyleOf,
   newId,
-  legacySidecarPathFor,
-  sidecarPathFor,
+  pathModeSidecarPaths,
   type AnnotationPathOptions,
   type Highlight,
   type MarkStyle,
+  type PenState,
   type PdfRect,
 } from "./annotations";
 import { buildDocIndex, anchorQuote } from "./anchor";
+import {
+  annotationColor,
+  annotationKindLabel,
+  annotationMatchesSearch,
+  annotationTypeOf,
+  normalizeSearch,
+  rollPrimaryText,
+  rollSecondaryText,
+  shortAnnotationText,
+  tagPreview,
+} from "./annotation-format";
+import { buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
+import { copyHighlightLink } from "./copy-link";
+import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha } from "./color";
+import type { AnnotationHub } from "./annotation-hub";
 import { parseLegacyNote, targetBasename, type LegacyAnnotation } from "./legacy-import";
-import { PdfBundleManager } from "./bundles";
+import { fallbackAnnotationBinding, PdfBundleManager } from "./bundles";
 import { copyPdfDataForWorker } from "./pdf-data";
 import {
   fitFoldedMarginCardHeights,
@@ -60,19 +80,13 @@ import {
   syncMarginCardPresentation,
 } from "./margin-card";
 
-const MAX_HIGHLIGHT_ALPHA = 0.46;
 /** DOM that belongs to us; mutations inside it must not re-trigger syncing. */
 const OWN_DOM_SELECTOR =
   ".lpa-native-hl-layer, .lpa-native-note-layer, .lpa-native-roll, .lpa-native-controls, .lpa-native-margins";
 /** Below this rail width cards are unreadable — skip the side entirely. */
 const RAIL_HIDE_WIDTH = 42;
-/** Below this, activating a mark asks native PDF zoom to create readable margin. */
-const RAIL_READABLE_WIDTH = 156;
 /** Keep right-rail cards clear of the native scrollbar. */
 const RAIL_SCROLLBAR_GUTTER = 14;
-const RAIL_AUTO_ZOOM_MAX_STEPS = 5;
-const RAIL_AUTO_ZOOM_SETTLE_MS = 170;
-const RAIL_AUTO_ZOOM_MEASURE_ATTEMPTS = 12;
 
 interface PageGeom {
   vp1: any; // pdf.js viewport at scale 1 (the page's own /Rotate applied)
@@ -144,7 +158,10 @@ export class NativeOverlayManager {
     private plugin: Plugin,
     private enabled: () => boolean,
     private getAnnotationPathOptions: () => AnnotationPathOptions,
-    private bundleManager?: PdfBundleManager
+    private bundleManager?: PdfBundleManager,
+    private getShowMarginCards: () => boolean = () => false,
+    private pen?: PenState,
+    private hub?: AnnotationHub
   ) {}
 
   private get app(): App {
@@ -195,6 +212,18 @@ export class NativeOverlayManager {
       .forEach((el) => el.remove());
   }
 
+  /** Re-apply UI-affecting settings on live overlays (e.g. margin cards toggled). */
+  refreshUi(): void {
+    for (const overlay of this.overlays.values()) overlay.refreshUi();
+  }
+
+  /** Settle pending debounced saves for this file (rename-follow). */
+  async flushAnnotations(file: TFile): Promise<void> {
+    for (const overlay of this.overlays.values()) {
+      if (overlay.file.path === file.path) await overlay.flushAnnotations();
+    }
+  }
+
   overlayFor(leaf: WorkspaceLeaf | null): NativePdfOverlay | null {
     return leaf ? this.overlays.get(leaf) ?? null : null;
   }
@@ -218,7 +247,10 @@ export class NativeOverlayManager {
       leaf,
       file,
       this.getAnnotationPathOptions,
-      this.bundleManager
+      this.bundleManager,
+      this.getShowMarginCards,
+      this.pen,
+      this.hub
     );
     this.overlays.set(leaf, overlay);
     this.refresh();
@@ -323,12 +355,16 @@ export class NativePdfOverlay {
   private syncQueued = false;
   private cleanups: Array<() => void> = [];
 
-  private currentColor = DEFAULT_COLOR;
+  private currentColor = defaultColor();
   private currentStyle: MarkStyle = "highlight";
   private tagMode = false;
   private warnedRotated = false;
 
-  private pendingSelection: { text: string; byPage: Map<number, PdfRect[]> } | null = null;
+  private pendingSelection: {
+    text: string;
+    byPage: Map<number, PdfRect[]>;
+    context?: { prefix?: string; suffix?: string };
+  } | null = null;
   private selectionPopoverEl: HTMLElement | null = null;
   private editPopoverCleanup: (() => void) | null = null;
 
@@ -349,21 +385,32 @@ export class NativePdfOverlay {
   private readonly railScrollHandler = () => this.onNativeScroll();
   private railWidths = { left: 0, right: 0 };
   private railRaf: number | null = null;
-  private railAutoZoomToken = 0;
   private pointerRaf: number | null = null;
   private lastPointer: { x: number; y: number; pageEl: HTMLElement | null } | null = null;
   private hoverId: string | null = null;
   private activeId: string | null = null;
   private hoverClearTimer: number | null = null;
   private scrollSettleTimer: number | null = null;
+  private mobileSelectionTimer: number | null = null;
 
   constructor(
     private plugin: Plugin,
     private leaf: WorkspaceLeaf,
     readonly file: TFile,
     private getAnnotationPathOptions: () => AnnotationPathOptions,
-    private bundleManager?: PdfBundleManager
-  ) {}
+    private bundleManager?: PdfBundleManager,
+    private getShowMarginCards: () => boolean = () => false,
+    private pen?: PenState,
+    private hub?: AnnotationHub
+  ) {
+    this.hubKey = `overlay-${newId()}`;
+    if (pen) {
+      this.currentColor = pen.getColor();
+      this.currentStyle = pen.getStyle();
+    }
+  }
+
+  private readonly hubKey: string;
 
   private get app(): App {
     return this.plugin.app;
@@ -394,37 +441,42 @@ export class NativePdfOverlay {
       ? this.pdfDoc.fingerprints[0]
       : this.pdfDoc.fingerprint;
     const pathOptions = this.getAnnotationPathOptions();
-    let annotationPath = sidecarPathFor(this.file.path, pathOptions);
-    let fallbackPaths = [legacySidecarPathFor(this.file.path)];
-    let migrateFallback = false;
-    let annotationBackupPath: string | undefined;
+    let binding = fallbackAnnotationBinding(this.file.path, pathOptions);
     if (this.bundleManager) {
-      const binding = await this.bundleManager.prepare(this.file, data, fingerprint, pathOptions);
-      annotationPath = binding.annotationPath;
-      fallbackPaths = binding.fallbackAnnotationPaths;
-      migrateFallback = true;
-      annotationBackupPath = binding.annotationBackupPath;
+      try {
+        binding = await this.bundleManager.resolveBinding(this.file, data, fingerprint, pathOptions);
+      } catch (e: any) {
+        console.error(`${LOG_TAG} could not resolve annotation storage`, e);
+        if (pathOptions.documentIdentity === "hash") {
+          // Falling back here would fork the annotations away from the bundle.
+          throw e;
+        }
+        new Notice("PDF Annotator: annotation storage lookup failed — using the sidecar folder directly.");
+      }
     }
     this.store = new AnnotationStore(
       this.app.vault.adapter,
-      annotationPath,
+      binding.annotationPath,
       this.file.basename,
       this.file.path,
       fingerprint,
-      fallbackPaths,
-      migrateFallback,
-      annotationBackupPath
+      binding.fallbackPaths,
+      binding.migrateFallback,
+      binding.annotationBackupPath
     );
     await this.store.load();
     if (this.destroyed) return;
     this.notifyStoreChanged();
 
     const doc = this.contentRoot.ownerDocument;
-    this.listen(this.contentRoot, "mouseup", (evt) => this.onMouseUp(evt as MouseEvent));
+    // Pointer events cover mouse AND touch; Obsidian's native viewer stopped
+    // emitting mouseup reliably after 1.8 (see PDF++'s workaround history).
+    this.listen(this.contentRoot, "pointerup", (evt) => this.onMouseUp(evt as MouseEvent));
     this.listen(this.contentRoot, "click", (evt) => this.onClick(evt as MouseEvent));
+    this.listen(this.contentRoot, "contextmenu", (evt) => this.onContextMenu(evt as MouseEvent));
     this.listen(
       this.contentRoot,
-      "mousemove",
+      "pointermove",
       (evt) => this.onPointerMove(evt as MouseEvent),
       { passive: true }
     );
@@ -441,17 +493,41 @@ export class NativePdfOverlay {
 
     this.initMarginRail();
     this.scheduleSync();
+
+    if (this.hub && this.store) {
+      const store = this.store;
+      this.hub.register({
+        key: this.hubKey,
+        file: this.file,
+        store,
+        reveal: (id) => this.revealAnnotation(id),
+        remove: (id) => {
+          const page = store.get(id)?.page;
+          store.remove(id);
+          if (page !== undefined) this.repaintPage(page);
+          this.notifyStoreChanged();
+        },
+        copyLink: (id) => this.copyAnnotationLink(id),
+        ownsLeaf: (leaf) => leaf === this.leaf,
+      });
+    }
     console.log(`${LOG_TAG} native annotation overlay attached: ${this.file.path}`);
   }
 
   syncPdfPath(file: TFile): void {
     if (this.file !== file && this.file.path !== file.path) return;
     this.store?.setPdfPath(file.path, file.basename);
+    const options = this.getAnnotationPathOptions();
+    if (options.documentIdentity !== "hash") {
+      const paths = pathModeSidecarPaths(file.path, options);
+      this.store?.setSidecarPath(paths.annotationPath, paths.backupPath);
+    }
   }
 
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.hub?.unregister(this.hubKey);
 
     this.closeEditPopover();
     this.selectionPopoverEl?.remove();
@@ -486,7 +562,10 @@ export class NativePdfOverlay {
       win.clearTimeout(this.scrollSettleTimer);
       this.scrollSettleTimer = null;
     }
-    this.railAutoZoomToken++;
+    if (this.mobileSelectionTimer !== null) {
+      win.clearTimeout(this.mobileSelectionTimer);
+      this.mobileSelectionTimer = null;
+    }
     this.marginsEl?.remove();
     this.marginsEl = null;
     this.leftRailEl = null;
@@ -741,6 +820,9 @@ export class NativePdfOverlay {
       const div = layer.createDiv({ cls: "lpa-highlight lpa-mark--highlight" });
       applyPctBox(div, r, geom);
       div.style.setProperty("--lpa-hl-color", highlightPaintColor(r.color));
+      div.style.setProperty("--lpa-hl-color-active", activeHighlightPaintColor(r.color));
+      div.style.setProperty("--lpa-hl-color-active-gloss", activeHighlightGlossColor(r.color));
+      div.style.setProperty("--lpa-hl-color-active-bridge", activeHighlightBridgeColor(r.color));
       const ids = Array.from(r.ids);
       div.dataset.hlIds = ids.join(" ");
       if (ids.length === 1) div.dataset.hlId = ids[0];
@@ -774,10 +856,12 @@ export class NativePdfOverlay {
   ): void {
     const el = layer.createDiv({ cls: `lpa-highlight lpa-mark lpa-mark--${st}` });
     applyPctBox(el, lr, geom);
-    const pal = resolvePalette(h.color);
-    const ink = pal?.ink ?? markInkColor(h.color);
+    const ink = markStrokeColor(h.color);
     el.style.setProperty("--lpa-ink", ink);
     el.style.setProperty("--lpa-w", `${m.weight}px`);
+    el.style.setProperty("--lpa-hl-color-active", activeHighlightPaintColor(h.color));
+    el.style.setProperty("--lpa-hl-color-active-gloss", activeHighlightGlossColor(h.color));
+    el.style.setProperty("--lpa-hl-color-active-bridge", activeHighlightBridgeColor(h.color));
     if (st === "dashed") {
       el.style.setProperty(
         "--lpa-deco",
@@ -814,7 +898,7 @@ export class NativePdfOverlay {
     el.setCssProps({ left: `${x}%`, top: `${y}%` });
     el.style.setProperty(
       "--lpa-accent",
-      resolvePalette(annotationColor(tag))?.ink ?? markInkColor(annotationColor(tag))
+      annotationAccent(annotationColor(tag))
     );
     el.toggleClass("is-pinned", !!tag.isPinned);
     el.toggleClass("is-active", tag.id === this.activeId);
@@ -956,7 +1040,19 @@ export class NativePdfOverlay {
     if (rotated) this.warnRotatedOnce();
     if (byPage.size === 0) return;
 
-    this.pendingSelection = { text, byPage };
+    let context: { prefix?: string; suffix?: string } | undefined;
+    try {
+      const first = sel.getRangeAt(0);
+      const last = sel.getRangeAt(sel.rangeCount - 1);
+      const startText = first.startContainer.textContent ?? "";
+      const endText = last.endContainer.textContent ?? "";
+      const prefix = startText.slice(Math.max(0, first.startOffset - 32), first.startOffset);
+      const suffix = endText.slice(last.endOffset, last.endOffset + 32);
+      if (prefix || suffix) context = { prefix: prefix || undefined, suffix: suffix || undefined };
+    } catch {
+      /* context is best-effort */
+    }
+    this.pendingSelection = { text, byPage, context };
     this.showSelectionPopover(anchorX, anchorY);
   }
 
@@ -969,48 +1065,58 @@ export class NativePdfOverlay {
     this.selectionPopoverEl = pop;
     pop.style.setProperty(
       "--lpa-accent",
-      resolvePalette(this.currentColor)?.ink ?? markInkColor(this.currentColor)
+      annotationAccent(this.currentColor)
     );
     pop.onmousedown = (evt) => {
       evt.preventDefault();
       evt.stopPropagation();
     };
+    pop.onpointerdown = (evt) => {
+      // Keep the text selection alive through the tap/click on the popover.
+      evt.preventDefault();
+      evt.stopPropagation();
+    };
 
+    const bindAction = (btn: HTMLElement, fn: (evt: Event) => void) => {
+      if (Platform.isMobile) {
+        btn.addEventListener("pointerup", (evt) => {
+          evt.preventDefault();
+          evt.stopPropagation();
+          fn(evt);
+        });
+      } else {
+        btn.onclick = (evt) => {
+          evt.preventDefault();
+          fn(evt);
+        };
+      }
+    };
+
+    // Row 1 — colors. Clicking a color IS the commit: the mark is created
+    // immediately with the current style; notes come from clicking the mark.
     const swatches = pop.createDiv({ cls: "lpa-selection-swatches", attr: { "aria-label": "Highlight color" } });
     for (const p of PALETTE) {
       const sw = swatches.createEl("button", { cls: "lpa-swatch", attr: { "aria-label": p.name, title: p.name } });
       sw.setCssProps({ background: p.fill });
       sw.dataset.color = p.fill;
       sw.toggleClass("is-active", p.fill === this.currentColor);
-      sw.onclick = (evt) => {
-        evt.preventDefault();
+      bindAction(sw, () => {
         this.currentColor = p.fill;
-        pop.style.setProperty("--lpa-accent", p.ink);
-        for (const candidate of Array.from(swatches.querySelectorAll<HTMLElement>(".lpa-swatch"))) {
-          candidate.toggleClass("is-active", candidate.dataset.color === p.fill);
-        }
-      };
+        this.pen?.set(this.currentColor, this.currentStyle);
+        this.commitSelection("highlight", x, y);
+      });
     }
 
-    const highlightBtn = pop.createEl("button", { cls: "lpa-selection-action", text: "Highlight" });
-    highlightBtn.onclick = (evt) => {
-      evt.preventDefault();
-      this.commitSelection("highlight", x, y);
-    };
-    const annotateBtn = pop.createEl("button", {
-      cls: "lpa-selection-action lpa-selection-action-primary",
-      text: "Annotate",
-    });
-    annotateBtn.onclick = (evt) => {
-      evt.preventDefault();
-      this.commitSelection("annotate", x, y);
-    };
-    const copyBtn = pop.createEl("button", { cls: "lpa-selection-action lpa-selection-action-quiet", text: "Copy" });
-    copyBtn.onclick = async (evt) => {
-      evt.preventDefault();
-      await navigator.clipboard.writeText(this.pendingSelection?.text ?? "");
-      new Notice("Copied selected text");
-    };
+    // Row 2 — styles (sets the pen; the next color click applies it).
+    buildSelectionStyleRow(
+      pop,
+      () => this.currentStyle,
+      () => this.currentColor,
+      (st) => {
+        this.currentStyle = st;
+        this.pen?.set(this.currentColor, this.currentStyle);
+      }
+    );
 
     pop.setCssProps({ visibility: "hidden" });
     const pr = pop.getBoundingClientRect();
@@ -1031,10 +1137,28 @@ export class NativePdfOverlay {
   }
 
   private onSelectionChange(): void {
-    if (!this.selectionPopoverEl) return;
+    // Idle early-out: nothing to hide and no mobile follow-up needed.
+    if (!Platform.isMobile && !this.selectionPopoverEl) return;
     const sel = this.contentRoot?.ownerDocument.getSelection();
-    if (!sel || sel.isCollapsed || sel.toString().trim().length === 0) {
+    const empty = !sel || sel.isCollapsed || sel.toString().trim().length === 0;
+    if (this.selectionPopoverEl && empty) {
       this.hideSelectionPopover(false);
+    }
+    if (Platform.isMobile && !empty) {
+      const win = this.contentRoot?.ownerDocument.defaultView ?? window;
+      if (this.mobileSelectionTimer !== null) win.clearTimeout(this.mobileSelectionTimer);
+      this.mobileSelectionTimer = win.setTimeout(() => {
+        this.mobileSelectionTimer = null;
+        // Same guards as the pointerup path — never create marks in tag mode
+        // or after teardown.
+        if (this.destroyed || !this.store || this.tagMode) return;
+        const cur = this.contentRoot?.ownerDocument.getSelection();
+        if (!cur || cur.isCollapsed || cur.toString().trim().length === 0) return;
+        const rects = cur.rangeCount ? Array.from(cur.getRangeAt(cur.rangeCount - 1).getClientRects()) : [];
+        const last = rects[rects.length - 1];
+        if (!last) return;
+        void this.captureSelection(cur, last.right, last.bottom);
+      }, 350);
     }
   }
 
@@ -1058,6 +1182,7 @@ export class NativePdfOverlay {
         isPinned: false,
       };
       if (mode === "annotate") h.note = "";
+      if (pending.context?.prefix || pending.context?.suffix) h.context = pending.context;
       store.add(h);
       created.push(h);
     }
@@ -1067,10 +1192,7 @@ export class NativePdfOverlay {
     if (mode === "annotate" && created[0]) {
       this.openEditPopover(created[0].id, anchorX, anchorY, { focusNote: true });
     } else if (created[0]) {
-      // A new plain highlight still owns a temporary side card. Reveal enough
-      // margin immediately so the user learns where that card lives.
       this.setActiveAnnotation(created[0].id);
-      void this.ensureReadableRailForAnnotation(created[0].id);
     }
   }
 
@@ -1155,155 +1277,30 @@ export class NativePdfOverlay {
     options: { focusNote?: boolean }
   ): void {
     const store = this.store;
-    const initial = store?.get(id);
-    if (!store || !initial) return;
+    if (!store || !store.get(id)) return;
     this.closeEditPopover();
     this.setActiveAnnotation(id);
-    void this.ensureReadableRailForAnnotation(id);
     const root = this.contentRoot;
     if (!root) return;
-    const doc = root.ownerDocument;
-    const pop = doc.body.createDiv({ cls: "lpa-mark-popover lpa-native-edit-popover" });
-    const type = annotationTypeOf(initial);
-
-    const repaint = () => {
-      const cur = store.get(id);
-      this.repaintPage((cur ?? initial).page);
-      this.notifyStoreChanged();
-    };
-
-    let styleRow: HTMLElement | null = null;
-    if (type === "highlight") {
-      styleRow = pop.createDiv({ cls: "lpa-styles", attr: { role: "radiogroup", "aria-label": "Mark style" } });
-      const syncStyleChecks = () => {
-        const cur = markStyleOf(store.get(id));
-        for (const b of Array.from(styleRow!.children) as HTMLElement[]) {
-          b.toggleClass("is-active", b.dataset.style === cur);
-        }
-      };
-      for (const st of MARK_STYLES) {
-        const btn = styleRow.createEl("button", {
-          cls: "lpa-style-btn",
-          attr: { "aria-label": MARK_STYLE_LABELS[st], title: MARK_STYLE_LABELS[st] },
-        });
-        btn.dataset.style = st;
-        const pal = resolvePalette(store.get(id)?.color ?? initial.color);
-        btn.createSpan({ cls: `lpa-style-sample lpa-style-sample--${st}`, text: "A", attr: { "aria-hidden": "true" } });
-        btn.style.setProperty("--lpa-ink", pal?.ink ?? initial.color);
-        btn.style.setProperty("--lpa-fill", pal?.fill ?? initial.color);
-        btn.onclick = () => {
-          store.update(id, { style: st });
-          repaint();
-          syncStyleChecks();
-        };
-      }
-      syncStyleChecks();
-    }
-
-    const colorRow = pop.createDiv({ cls: "lpa-swatches" });
-    const syncColorChecks = () => {
-      const cur = store.get(id);
-      const active = cur ? annotationColor(cur) : null;
-      for (const sw of Array.from(colorRow.children) as HTMLElement[]) {
-        sw.toggleClass("is-active", sw.dataset.color === active);
-      }
-    };
-    for (const p of PALETTE) {
-      const sw = colorRow.createEl("button", { cls: "lpa-swatch", attr: { "aria-label": p.name } });
-      sw.setCssProps({ background: p.fill });
-      sw.dataset.color = p.fill;
-      sw.onclick = () => {
-        const patch: Partial<Highlight> =
-          type === "tag" ? { color: p.fill, tagColor: p.fill } : { color: p.fill };
-        store.update(id, patch);
-        repaint();
-        if (styleRow) {
-          for (const b of Array.from(styleRow.children) as HTMLElement[]) {
-            b.style.setProperty("--lpa-ink", p.ink);
-            b.style.setProperty("--lpa-fill", p.fill);
-          }
-        }
-        syncColorChecks();
-      };
-    }
-    syncColorChecks();
-
-    if (type === "highlight" && initial.text) {
-      pop.createDiv({ cls: "lpa-native-popover-source", text: shortAnnotationText(initial.text, 160) });
-    }
-
-    const note = pop.createEl("textarea", {
-      cls: "lpa-native-note",
-      attr: {
-        placeholder: type === "tag" ? "Page note" : "Note",
-        rows: "3",
-        "aria-label": type === "tag" ? "Page note" : "Annotation note",
+    this.editPopoverCleanup = openAnnotationEditor(
+      {
+        doc: root.ownerDocument,
+        app: this.app,
+        get: (hid) => store.get(hid),
+        update: (hid, patch) => store.update(hid, patch),
+        remove: (hid) => store.remove(hid),
+        repaintPage: (page) => this.repaintPage(page),
+        notifyChanged: () => this.notifyStoreChanged(),
+        copyLink: (hid) => void this.copyAnnotationLink(hid),
+        onClose: () => {
+          this.editPopoverCleanup = null;
+        },
       },
-    });
-    note.value = initial.note ?? "";
-    note.oninput = () => {
-      store.update(id, { note: note.value });
-      repaint();
-    };
-
-    const sideNote = pop.createEl("textarea", {
-      cls: "lpa-native-note lpa-native-side-note",
-      attr: { placeholder: "Side note", rows: "2", "aria-label": "Side note" },
-    });
-    sideNote.value = initial.noteContentCJK ?? "";
-    sideNote.oninput = () => {
-      store.update(id, { noteContentCJK: sideNote.value.trim() ? sideNote.value : undefined });
-      this.notifyStoreChanged();
-    };
-
-    const actions = pop.createDiv({ cls: "lpa-popover-actions" });
-    const copyBtn = actions.createEl("button", { text: "Copy" });
-    copyBtn.onclick = async () => {
-      const cur = store.get(id);
-      await navigator.clipboard.writeText((cur?.note || cur?.text || tagPreview(cur ?? initial)).trim());
-      new Notice("Copied annotation text");
-    };
-    const delBtn = actions.createEl("button", { cls: "lpa-danger", text: "Delete" });
-    delBtn.onclick = () => {
-      const page = store.get(id)?.page ?? initial.page;
-      store.remove(id);
-      this.closeEditPopover();
-      this.repaintPage(page);
-      this.notifyStoreChanged();
-    };
-
-    // Position near the click, clamped into the window.
-    pop.setCssProps({ visibility: "hidden" });
-    const vw = doc.documentElement.clientWidth;
-    const vh = doc.documentElement.clientHeight;
-    const pr = pop.getBoundingClientRect();
-    let px = x + 6;
-    let py = y + 10;
-    if (px + pr.width > vw - 8) px = Math.max(8, vw - pr.width - 8);
-    if (py + pr.height > vh - 8) py = Math.max(8, y - pr.height - 10);
-    pop.setCssProps({ left: `${px}px`, top: `${py}px`, visibility: "visible" });
-
-    const onDocPointer = (e: MouseEvent) => {
-      if (!pop.contains(e.target as Node)) this.closeEditPopover();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") this.closeEditPopover();
-    };
-    // Defer so the opening click doesn't immediately dismiss it.
-    window.setTimeout(() => doc.addEventListener("mousedown", onDocPointer, true), 0);
-    doc.addEventListener("keydown", onKey, true);
-    this.editPopoverCleanup = () => {
-      doc.removeEventListener("mousedown", onDocPointer, true);
-      doc.removeEventListener("keydown", onKey, true);
-      pop.remove();
-    };
-
-    if (options.focusNote) {
-      window.setTimeout(() => {
-        note.focus();
-        note.selectionStart = note.selectionEnd = note.value.length;
-      }, 0);
-    }
+      id,
+      x,
+      y,
+      options
+    );
   }
 
   private closeEditPopover(): void {
@@ -1364,6 +1361,21 @@ export class NativePdfOverlay {
     }, 120);
   }
 
+  /** Re-apply UI-affecting settings (cards toggled, palette edited) live. */
+  refreshUi(): void {
+    this.scheduleSync();
+    this.scheduleRailLayout();
+  }
+
+  /** Settle any pending debounced save (rename-follow). */
+  async flushAnnotations(): Promise<void> {
+    try {
+      await this.store?.flush();
+    } catch (e) {
+      console.error(`${LOG_TAG} failed to save annotations`, e);
+    }
+  }
+
   private scheduleRailLayout(): void {
     if (this.destroyed || this.railRaf !== null || !this.marginsEl) return;
     const win = this.marginsEl.ownerDocument.defaultView ?? window;
@@ -1403,151 +1415,16 @@ export class NativePdfOverlay {
     scroller.addEventListener("scroll", this.railScrollHandler, { passive: true });
   }
 
-  private async ensureReadableRailForAnnotation(id: string): Promise<void> {
-    const store = this.store;
-    const first = store?.get(id);
-    if (!store || !first) return;
-    const token = ++this.railAutoZoomToken;
-    if (!this.geoms.has(first.page)) {
-      await this.ensureGeom(first.page);
-    }
-
-    let step = 0;
-    let measureAttempts = 0;
-    while (step < RAIL_AUTO_ZOOM_MAX_STEPS) {
-      if (this.destroyed || this.activeId !== id || token !== this.railAutoZoomToken) return;
-      const measure = this.measureAnnotationRail(id);
-      if (!measure) {
-        // Native PDF pages are painted lazily after list navigation. Give the
-        // target page a short window to appear before deciding no rail exists.
-        if (++measureAttempts >= RAIL_AUTO_ZOOM_MEASURE_ATTEMPTS) return;
-        await sleep(100);
-        continue;
-      }
-      measureAttempts = 0;
-      if (measure.width >= RAIL_READABLE_WIDTH) {
-        this.scheduleRailLayout();
-        return;
-      }
-
-      const zoomOut = this.findNativeZoomOutControl();
-      if (!zoomOut || this.isDisabledControl(zoomOut)) {
-        this.scheduleRailLayout();
-        return;
-      }
-
-      zoomOut.click();
-      step++;
-      await this.waitForRailAutoZoomSettle();
-    }
-    this.scheduleRailLayout();
-  }
-
-  private measureAnnotationRail(id: string): { side: "left" | "right"; width: number } | null {
-    const root = this.contentRoot;
-    const store = this.store;
-    const h = store?.get(id);
-    if (!root || !store || !h) return null;
-
-    const rootRect = root.getBoundingClientRect();
-    const scroller = this.findScroller() ?? root;
-    this.bindRailScroller(scroller);
-    const areaRect = scroller === root ? rootRect : scroller.getBoundingClientRect();
-    if (areaRect.width < 60 || areaRect.height < 60) return null;
-
-    let pageLeft = Infinity;
-    let pageRight = -Infinity;
-    let target: { box: DOMRect; geom: PageGeom } | null = null;
-    for (const b of this.collectPageBoxes()) {
-      if (b.box.bottom <= areaRect.top || b.box.top >= areaRect.bottom) continue;
-      pageLeft = Math.min(pageLeft, b.box.left);
-      pageRight = Math.max(pageRight, b.box.right);
-      if (b.idx !== h.page) continue;
-      const geom = this.geoms.get(b.idx);
-      if (geom && aspectMatches(b.box, geom)) target = { box: b.box, geom };
-    }
-    if (!Number.isFinite(pageLeft) || !Number.isFinite(pageRight) || !target) return null;
-
-    const naturalLeftWidth = Math.max(0, pageLeft - areaRect.left);
-    const naturalRightWidth = Math.max(0, areaRect.right - RAIL_SCROLLBAR_GUTTER - pageRight);
-    this.railWidths = { left: naturalLeftWidth, right: naturalRightWidth };
-
-    const anchor = this.computeNativeAnchor(h, target.box, target.geom, areaRect);
-    if (!anchor) return null;
-    return {
-      side: anchor.side,
-      width: anchor.side === "left" ? naturalLeftWidth : naturalRightWidth,
-    };
-  }
-
-  private findNativeZoomOutControl(): HTMLElement | null {
-    const container = this.leaf.view.containerEl;
-    const toolbar = container.querySelector<HTMLElement>(".pdf-toolbar") ?? container;
-    const raw = Array.from(
-      toolbar.querySelectorAll<HTMLElement>("button, [role='button'], .clickable-icon, [aria-label], [title]")
-    );
-    const candidates: HTMLElement[] = [];
-    for (const el of raw) {
-      if (el.closest(".lpa-native-controls")) continue;
-      const clickable = el.closest<HTMLElement>("button, [role='button'], .clickable-icon") ?? el;
-      if (!toolbar.contains(clickable) || clickable.closest(".lpa-native-controls")) continue;
-      if (!candidates.includes(clickable)) candidates.push(clickable);
-    }
-
-    const direct = candidates.find((el) => this.isZoomOutLabel(this.controlLabel(el)));
-    if (direct) return direct;
-
-    const zoomInIdx = candidates.findIndex((el) => this.isZoomInLabel(this.controlLabel(el)));
-    if (zoomInIdx > 0) return candidates[zoomInIdx - 1] ?? null;
-    return null;
-  }
-
-  private controlLabel(el: HTMLElement): string {
-    const svg = el.querySelector<SVGElement>("svg");
-    return [
-      el.getAttribute("aria-label"),
-      el.getAttribute("title"),
-      el.getAttribute("data-tooltip"),
-      el.textContent,
-      el.className,
-      svg?.getAttribute("aria-label"),
-      svg?.getAttribute("class"),
-      svg?.getAttribute("data-icon"),
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-  }
-
-  private isZoomOutLabel(label: string): boolean {
-    return /zoom\s*out|zoom-out|缩小|縮小|minus/.test(label);
-  }
-
-  private isZoomInLabel(label: string): boolean {
-    return /zoom\s*in|zoom-in|放大|plus/.test(label);
-  }
-
-  private isDisabledControl(el: HTMLElement): boolean {
-    return !!el.closest("[disabled], [aria-disabled='true'], .is-disabled, .mod-disabled");
-  }
-
-  private waitForRailAutoZoomSettle(): Promise<void> {
-    const win = this.contentRoot?.ownerDocument.defaultView ?? window;
-    return new Promise((resolve) => {
-      win.setTimeout(() => {
-        this.scheduleSync();
-        this.scheduleRailLayout();
-        resolve();
-      }, RAIL_AUTO_ZOOM_SETTLE_MS);
-    });
-  }
-
   private layoutRail(): void {
     if (this.destroyed) return;
     const root = this.contentRoot;
     const margins = this.marginsEl;
     const store = this.store;
     if (!root || !margins || !this.leftRailEl || !this.rightRailEl || !store) return;
+    if (!this.getShowMarginCards()) {
+      this.clearRail();
+      return;
+    }
 
     const rootRect = root.getBoundingClientRect();
     const scroller = this.findScroller() ?? root;
@@ -1642,6 +1519,7 @@ export class NativePdfOverlay {
   /** Same policy as the custom view: tags show a card while pinned or engaged;
    * highlights show once they carry a note / side note / pin, or while engaged. */
   private wantsMarginCard(h: Highlight): boolean {
+    if (!this.getShowMarginCards()) return false;
     if (annotationTypeOf(h) === "tag") {
       return !!h.isPinned || h.id === this.hoverId || h.id === this.activeId;
     }
@@ -1766,7 +1644,7 @@ export class NativePdfOverlay {
 
     card.addEventListener("mouseenter", () => this.setHoveredAnnotation(h.id));
     card.addEventListener("mouseleave", () => this.clearHoveredAnnotationSoon(h.id));
-    card.addEventListener("contextmenu", (evt) => this.openCardContextMenu(evt, h.id));
+    card.addEventListener("contextmenu", (evt) => this.openAnnotationContextMenu(evt, h.id));
     card.addEventListener("click", (evt) => {
       const target = evt.target as HTMLElement | null;
       if (target?.closest("textarea,button")) return;
@@ -1837,7 +1715,7 @@ export class NativePdfOverlay {
    * that currently has focus, so in-place edits are never clobbered). */
   private syncCardContent(card: HTMLElement, h: Highlight): void {
     const pal = resolvePalette(annotationColor(h));
-    card.style.setProperty("--lpa-accent", pal?.ink ?? markInkColor(annotationColor(h)));
+    card.style.setProperty("--lpa-accent", annotationAccent(annotationColor(h)));
     card.style.setProperty("--lpa-sticker-bg", stickerBackgroundColor(annotationColor(h), 0.34));
     card.style.setProperty("--lpa-sticker-bg-strong", stickerBackgroundColor(annotationColor(h), 0.52));
     card.toggleClass("is-pinned", !!h.isPinned);
@@ -1932,7 +1810,7 @@ export class NativePdfOverlay {
         anchor.side === "left" ? cardRect.right - marginsRect.left : cardRect.left - marginsRect.left;
       const cardY = cardRect.top + cardRect.height / 2 - marginsRect.top;
       const borderX = anchor.side === "left" ? anchor.pageLeftX : anchor.pageRightX;
-      const accent = resolvePalette(annotationColor(h))?.ink ?? markInkColor(annotationColor(h));
+      const accent = annotationAccent(annotationColor(h));
       const isTag = annotationTypeOf(h) === "tag";
       const engaged = h.id === this.hoverId || h.id === this.activeId;
       const d = isTag
@@ -1983,7 +1861,7 @@ export class NativePdfOverlay {
     this.notifyStoreChanged();
   }
 
-  private openCardContextMenu(evt: MouseEvent, id: string): void {
+  private openAnnotationContextMenu(evt: MouseEvent, id: string): void {
     const h = this.store?.get(id);
     if (!h) return;
     evt.preventDefault();
@@ -1991,23 +1869,37 @@ export class NativePdfOverlay {
     const menu = new Menu();
     menu.addItem((item) =>
       item
-        .setTitle(h.isPinned ? "Unpin card" : "Pin card")
-        .setIcon("pin")
-        .onClick(() => this.toggleAnnotationPin(id))
-    );
-    const moveTo = (side: "left" | "right" | "auto") => {
-      this.store?.update(id, { marginSide: side });
-      this.notifyStoreChanged();
-    };
-    menu.addItem((item) =>
-      item.setTitle("Move card to left margin").setIcon("arrow-left").onClick(() => moveTo("left"))
+        .setTitle("Edit annotation")
+        .setIcon("pencil")
+        .onClick(() => this.openEditPopover(id, evt.clientX, evt.clientY, { focusNote: true }))
     );
     menu.addItem((item) =>
-      item.setTitle("Move card to right margin").setIcon("arrow-right").onClick(() => moveTo("right"))
+      item
+        .setTitle("Copy link")
+        .setIcon("link")
+        .onClick(() => void this.copyAnnotationLink(id))
     );
-    menu.addItem((item) =>
-      item.setTitle("Auto-place card").setIcon("wand").onClick(() => moveTo("auto"))
-    );
+    if (this.getShowMarginCards()) {
+      menu.addItem((item) =>
+        item
+          .setTitle(h.isPinned ? "Unpin card" : "Pin card")
+          .setIcon("pin")
+          .onClick(() => this.toggleAnnotationPin(id))
+      );
+      const moveTo = (side: "left" | "right" | "auto") => {
+        this.store?.update(id, { marginSide: side });
+        this.notifyStoreChanged();
+      };
+      menu.addItem((item) =>
+        item.setTitle("Move card to left margin").setIcon("arrow-left").onClick(() => moveTo("left"))
+      );
+      menu.addItem((item) =>
+        item.setTitle("Move card to right margin").setIcon("arrow-right").onClick(() => moveTo("right"))
+      );
+      menu.addItem((item) =>
+        item.setTitle("Auto-place card").setIcon("wand").onClick(() => moveTo("auto"))
+      );
+    }
     menu.addSeparator();
     menu.addItem((item) =>
       item
@@ -2021,6 +1913,63 @@ export class NativePdfOverlay {
         })
     );
     menu.showAtMouseEvent(evt);
+  }
+
+  /** Right-click on a painted mark or tag: rects are pointer-events:none, so
+   * hit-test in JS and only hijack the native menu on an actual hit. */
+  private onContextMenu(evt: MouseEvent): void {
+    if (this.destroyed || !this.store) return;
+    if (Platform.isPhone) return;
+    const target = evt.target as HTMLElement | null;
+    if (target?.closest(OWN_DOM_SELECTOR)) return;
+    if (target?.closest(".pdf-toolbar, .lpa-mark-popover, .lpa-selection-popover, a, .annotationLayer")) return;
+    const sel = this.contentRoot?.ownerDocument.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
+    const hit = this.annotationAtPoint(evt.clientX, evt.clientY);
+    if (!hit) return;
+    this.openAnnotationContextMenu(evt, hit.id);
+  }
+
+  private async copyAnnotationLink(id: string): Promise<void> {
+    const h = this.store?.get(id);
+    if (!h) return;
+    await copyHighlightLink(
+      this.app,
+      this.file,
+      h,
+      [
+        // The native text layer is the ONLY safe source for selection indices:
+        // Obsidian stamps [data-idx] with exactly the indices its own links
+        // resolve to. Indices from our pinned pdf.js could differ (text-item
+        // segmentation changed across pdf.js majors), so when the page is not
+        // rendered we degrade to a page link instead of risking wrong words.
+        () => this.nativeChunksForPage(h.page),
+      ],
+      async () => {
+        const geom = await this.ensureGeom(h.page);
+        return geom ? { w: geom.w, h: geom.h } : null;
+      }
+    );
+  }
+
+  /** Text-item chunks for a rendered native page, indexed by [data-idx].
+   * Direct children only, and any duplicate index bails out — a corrupted map
+   * must degrade to a page link, never emit wrong offsets. */
+  private nativeChunksForPage(pageIndex: number): string[] | null {
+    const root = this.contentRoot;
+    if (!root) return null;
+    const pageEl = root.querySelector<HTMLElement>(`.page[data-page-number="${pageIndex + 1}"]`);
+    const nodes = pageEl?.querySelectorAll<HTMLElement>(":scope > .textLayer > [data-idx]");
+    if (!nodes || !nodes.length) return null;
+    const chunks: string[] = [];
+    for (const el of Array.from(nodes)) {
+      const idx = Number(el.dataset.idx);
+      if (!Number.isFinite(idx) || idx < 0) return null;
+      if (chunks[idx] !== undefined) return null;
+      chunks[idx] = el.textContent ?? "";
+    }
+    for (let i = 0; i < chunks.length; i++) if (chunks[i] === undefined) chunks[i] = "";
+    return chunks;
   }
 
   // ---- hover / active binding between marks, tags, and cards -------------------
@@ -2218,7 +2167,7 @@ export class NativePdfOverlay {
       const item = listEl.createDiv({ cls: "lpa-native-roll-item" });
       item.style.setProperty(
         "--lpa-accent",
-        resolvePalette(annotationColor(h))?.ink ?? markInkColor(annotationColor(h))
+        annotationAccent(annotationColor(h))
       );
       const head = item.createDiv({ cls: "lpa-native-roll-item-head" });
       head.createSpan({ cls: "lpa-native-roll-page", text: `p.${h.page + 1}` });
@@ -2238,9 +2187,6 @@ export class NativePdfOverlay {
     const pageEl = await this.navigateNativeToPage(h.page);
     if (!pageEl) return;
     pageEl.scrollIntoView({ block: "center" });
-    // This routine polls through the native viewer's lazy page render and then
-    // zooms out only until the selected card has readable side space.
-    void this.ensureReadableRailForAnnotation(id);
     this.scheduleRailLayout();
     // The native viewer renders lazily; poll briefly for the painted mark.
     const isTag = annotationTypeOf(h) === "tag";
@@ -2629,54 +2575,6 @@ function mergeLineRects(rects: BaseRect[]): BaseRect[] {
   return lines.sort((a, b) => a.top - b.top || a.left - b.left);
 }
 
-interface Rgba {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
-}
-
-function parseColor(color: string): Rgba | null {
-  const rgb = color.match(
-    /^rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)(?:\s*,\s*([0-9.]+)\s*)?\)$/i
-  );
-  if (rgb) {
-    return {
-      r: clampCssByte(Number(rgb[1])),
-      g: clampCssByte(Number(rgb[2])),
-      b: clampCssByte(Number(rgb[3])),
-      a: rgb[4] === undefined ? 1 : clampCssAlpha(Number(rgb[4])),
-    };
-  }
-  const hex = color.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
-  if (hex) {
-    const value = hex[1].length === 3 ? hex[1].split("").map((ch) => ch + ch).join("") : hex[1];
-    return {
-      r: parseInt(value.slice(0, 2), 16),
-      g: parseInt(value.slice(2, 4), 16),
-      b: parseInt(value.slice(4, 6), 16),
-      a: 1,
-    };
-  }
-  return null;
-}
-
-function highlightPaintColor(color: string): string {
-  const pal = resolvePalette(color);
-  const fill = pal?.fill ?? color;
-  const c = parseColor(fill);
-  if (!c) return fill;
-  const a = pal?.highlightAlpha ?? Math.min(c.a === 1 ? MAX_HIGHLIGHT_ALPHA : c.a, MAX_HIGHLIGHT_ALPHA);
-  return `rgba(${c.r}, ${c.g}, ${c.b}, ${clampCssAlpha(a)})`;
-}
-
-function markInkColor(color: string): string {
-  const c = parseColor(color);
-  if (!c) return color;
-  const k = 0.62;
-  return `rgba(${Math.round(c.r * k)}, ${Math.round(c.g * k)}, ${Math.round(c.b * k)}, 0.95)`;
-}
-
 /** Calm card tint derived from the mark color (same recipe as the custom view). */
 function stickerBackgroundColor(color: string, alpha: number): string {
   const pal = resolvePalette(color);
@@ -2686,82 +2584,8 @@ function stickerBackgroundColor(color: string, alpha: number): string {
   return `rgba(${c.r}, ${c.g}, ${c.b}, ${clampCssAlpha(alpha)})`;
 }
 
-function withAlpha(color: string, alpha: number): string {
-  const c = parseColor(color);
-  if (!c) return color;
-  return `rgba(${c.r}, ${c.g}, ${c.b}, ${clampCssAlpha(alpha)})`;
-}
-
-function clampCssByte(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.min(255, Math.max(0, Math.round(value)));
-}
-
-function clampCssAlpha(value: number): number {
-  if (!Number.isFinite(value)) return MAX_HIGHLIGHT_ALPHA;
-  return Math.min(1, Math.max(0, value));
-}
-
 function clamp(min: number, value: number, max: number): number {
   return Math.min(max, Math.max(min, value));
-}
-
-function annotationTypeOf(h: Highlight): "highlight" | "tag" {
-  return h.type === "tag" ? "tag" : "highlight";
-}
-
-function annotationColor(h: Highlight): string {
-  return h.tagColor ?? h.color;
-}
-
-function tagPreview(h: Highlight): string {
-  const raw = (h.note || h.text || "Note").replace(/\bnote:\s*/gi, " ").replace(/\s+/g, " ").trim();
-  const words = raw.split(/\s+/).filter(Boolean).slice(0, 5).join(" ");
-  return words || "Note";
-}
-
-function annotationKindLabel(h: Highlight): string {
-  if (annotationTypeOf(h) === "tag") return "tag";
-  const st = markStyleOf(h);
-  return st === "highlight" ? "highlight" : MARK_STYLE_LABELS[st].toLowerCase();
-}
-
-function shortAnnotationText(text: string, max: number): string {
-  const clean = text.replace(/\s+/g, " ").trim();
-  return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
-}
-
-function rollPrimaryText(h: Highlight): string {
-  const text = (h.note || h.noteContentCJK || h.text || tagPreview(h)).replace(/\s+/g, " ").trim();
-  return shortAnnotationText(text || "Untitled note", 160);
-}
-
-function rollSecondaryText(h: Highlight): string {
-  const chunks: string[] = [];
-  if (h.note && h.noteContentCJK) chunks.push(h.noteContentCJK);
-  if (annotationTypeOf(h) === "highlight" && h.text) chunks.push(h.text);
-  return shortAnnotationText(chunks.join("  "), 180);
-}
-
-function normalizeSearch(value: string): string {
-  return value.trim().replace(/\s+/g, " ").toLowerCase();
-}
-
-function annotationMatchesSearch(h: Highlight, query: string): boolean {
-  const haystack = [
-    `p.${h.page + 1}`,
-    String(h.page + 1),
-    annotationKindLabel(h),
-    h.note,
-    h.noteContentCJK,
-    h.text,
-    tagPreview(h),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .toLowerCase();
-  return query.split(" ").every((part) => haystack.includes(part));
 }
 
 function measureMarginCardHeight(card: HTMLElement): number {

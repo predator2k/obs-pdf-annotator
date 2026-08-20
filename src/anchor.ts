@@ -45,7 +45,7 @@ export interface DocIndex {
 }
 
 /** Per-character normalization. Returns "" to drop the char, or 1+ chars. */
-function normChar(c: string): string {
+export function normChar(c: string): string {
   if (/\s/.test(c)) return "";
   const code = c.charCodeAt(0);
   if (code === 0x00ad || code === 0x200b || code === 0x200c || code === 0x200d || code === 0xfeff)
@@ -58,7 +58,7 @@ function normChar(c: string): string {
   return c.normalize("NFKC").toLowerCase();
 }
 
-function normStr(s: string): string {
+export function normStr(s: string): string {
   let out = "";
   for (const c of s) out += normChar(c);
   return out;
@@ -165,7 +165,7 @@ function resultsFromSpan(doc: DocIndex, gStart: number, gEnd: number): AnchorRes
   return out;
 }
 
-function contextScore(search: string, start: number, end: number, nPrefix?: string, nSuffix?: string): number {
+export function contextScore(search: string, start: number, end: number, nPrefix?: string, nSuffix?: string): number {
   let score = 0;
   if (nPrefix) {
     const tail = nPrefix.slice(-12);

@@ -11,6 +11,15 @@ const tests = [
   { entry: "test/margin-card-smoke.ts" },
   { entry: "test/pdf-data-smoke.ts" },
   { entry: "test/bundle-identity-smoke.ts" },
+  { entry: "test/pdf-link-smoke.ts" },
+  {
+    entry: "test/annotation-format-smoke.ts",
+    alias: { obsidian: path.join(root, "test/obsidian-stub.ts") },
+  },
+  {
+    entry: "test/palette-smoke.ts",
+    alias: { obsidian: path.join(root, "test/obsidian-stub.ts") },
+  },
   {
     entry: "test/bundle-manager-smoke.ts",
     alias: { obsidian: path.join(root, "test/obsidian-stub.ts") },

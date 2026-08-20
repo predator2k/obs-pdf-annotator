@@ -1654,3 +1654,184 @@
   font-size: 12px;
   line-height: 1.35;
 }
+
+/* ---- Margin cards disabled (default): popup-first note editing ---------- */
+/* The popup editor (.lpa-mark-popover / .lpa-native-edit-popover) is the
+   note UX in both modes; the margin columns collapse away entirely. */
+.lpa-root.lpa-cards-off .lpa-margin,
+.lpa-root.lpa-cards-off .lpa-margin-toggle,
+.lpa-root.lpa-cards-off .lpa-connection-layer {
+  display: none;
+}
+
+/* ---- Pre-commit style row in the selection popovers --------------------- */
+.lpa-selection-popover .lpa-selection-styles {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  margin: 2px 0;
+}
+
+/* ---- Annotations sidebar panel ------------------------------------------ */
+.lpa-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+}
+.lpa-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.lpa-panel-title {
+  font-weight: 600;
+  font-size: var(--font-ui-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lpa-panel-meta {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  flex: 0 0 auto;
+}
+.lpa-panel-search {
+  width: 100%;
+}
+.lpa-panel-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 12px;
+}
+.lpa-panel-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding: 12px 4px;
+}
+.lpa-panel-item {
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--lpa-accent, var(--background-modifier-border));
+  border-radius: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  background: var(--background-primary);
+}
+.lpa-panel-item:hover {
+  background: var(--background-modifier-hover);
+}
+.lpa-panel-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: 2px;
+}
+.lpa-panel-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--lpa-accent, var(--text-muted));
+  flex: 0 0 auto;
+}
+.lpa-panel-note {
+  font-size: var(--font-ui-small);
+  line-height: 1.35;
+  word-break: break-word;
+}
+.lpa-panel-source {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.3;
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+/* ---- Mobile ----------------------------------------------------------- */
+/* Obsidian stamps .is-mobile on the app container. Touch targets ≥ 40px. */
+.is-mobile .lpa-mark-popover .lpa-swatch,
+.is-mobile .lpa-selection-popover .lpa-swatch {
+  width: 28px;
+  height: 28px;
+}
+.is-mobile .lpa-mark-popover .lpa-style-btn,
+.is-mobile .lpa-selection-popover .lpa-style-btn {
+  min-width: 40px;
+  min-height: 36px;
+}
+.is-mobile .lpa-selection-action,
+.is-mobile .lpa-popover-actions button {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+.is-mobile .lpa-native-edit-popover {
+  width: min(340px, calc(100vw - 24px));
+}
+/* The phone editor lives in a modal; give its controls the popover styling. */
+.lpa-editor-modal .lpa-styles,
+.lpa-editor-modal .lpa-swatches,
+.lpa-editor-modal .lpa-popover-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.lpa-editor-modal .lpa-native-note {
+  width: 100%;
+  margin-bottom: 8px;
+  min-height: 72px;
+}
+.lpa-editor-modal .lpa-native-popover-source {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin-bottom: 8px;
+}
+
+/* ---- Selection popover: two rows, color-click commits ------------------- */
+.lpa-selection-popover {
+  flex-direction: column;
+  align-items: stretch;
+  max-height: none;
+  gap: 6px;
+  padding: 7px 9px;
+}
+.lpa-selection-popover .lpa-selection-swatches {
+  border-right: none;
+  padding-right: 0;
+  gap: 6px;
+  justify-content: flex-start;
+}
+.lpa-selection-popover .lpa-swatch {
+  width: 24px;
+  height: 24px;
+}
+.lpa-selection-popover .lpa-selection-styles {
+  margin: 0;
+  gap: 3px;
+}
+.is-mobile .lpa-selection-popover .lpa-swatch {
+  width: 30px;
+  height: 30px;
+}
+
+/* ---- Dark theme: punchier annotation chrome ----------------------------- */
+/* Accents are computed theme-aware in JS (saturated color instead of dark
+   ink); these rules keep the small chrome legible on dark surfaces. */
+.theme-dark .lpa-swatch {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+.theme-dark .lpa-swatch.is-active {
+  border-color: var(--background-primary);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.65);
+}
+.theme-dark .lpa-style-btn.is-active {
+  background: color-mix(in srgb, var(--lpa-fill, transparent) 28%, transparent);
+}
+.theme-dark .lpa-style-sample {
+  color: var(--text-normal);
+}

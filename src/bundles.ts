@@ -1,30 +1,39 @@
 /**
- * bundles.ts — path-independent, recoverable PDF + annotation persistence.
+ * bundles.ts — annotation storage resolution for both identity modes.
  *
- * A PDF's SHA-256 is its durable identity. Every document gets one bundle at:
+ * PATH mode (default): the sidecar lives at a path mirrored from the PDF's
+ * vault path (e.g. "PDF annotations/Books/Novel.annotations.md"). Annotations
+ * survive content edits, and renames inside Obsidian move the sidecar along
+ * (see moveSidecarsForRename). No hashing at open once no legacy bundle data
+ * remains; while it does, one memoized hash per open keeps migration safe.
+ *
+ * HASH mode (optional): a PDF's SHA-256 is its durable identity. Every
+ * document gets one bundle at:
  *
  *   .pdf-annotator/bundles/sha256/<hash>/
- *     document.pdf
  *     annotations.md
  *     manifest.json
  *
- * The visible vault path is metadata only. Moving/renaming a PDF therefore
- * cannot orphan its annotations; replacing a file at the same path with
- * different bytes cannot accidentally inherit somebody else's annotations.
+ * Moving/renaming a PDF (even outside Obsidian) cannot orphan its annotations;
+ * replacing a file at the same path with different bytes cannot accidentally
+ * inherit somebody else's annotations.
+ *
+ * Older releases also copied the whole PDF into the bundle as document.pdf.
+ * That backup feature is retired: no new copies are written and leftover
+ * copies are deleted when their PDF is next opened (or in bulk via the
+ * "Delete stored PDF copies" command).
  */
 import { App, TFile, normalizePath } from "obsidian";
 import {
   legacySidecarPathFor,
   parseAnnotations,
+  pathModeSidecarPaths,
   sidecarPathFor,
   type AnnotationPathOptions,
 } from "./annotations";
 import { PDF_BUNDLE_LIBRARY, pathsForHash, sha256Hex } from "./bundle-identity";
 
 export { PDF_BUNDLE_LIBRARY, sha256Hex } from "./bundle-identity";
-
-export const DEFAULT_RECOVERY_FOLDER = "Recovered PDFs";
-const BACKUP_VERIFY_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface PdfBundleManifest {
   version: 1;
@@ -52,10 +61,31 @@ export interface PdfBundleBinding {
   manifest: PdfBundleManifest;
 }
 
-export interface BundleVerification {
-  manifest: PdfBundleManifest;
-  ok: boolean;
-  reason?: string;
+export interface StoredCopyStats {
+  count: number;
+  bytes: number;
+  /** Copies kept because no working PDF exists anywhere in the vault. */
+  keptOrphans: number;
+}
+
+/** What an AnnotationStore needs, independent of the identity mode. */
+export interface AnnotationBinding {
+  annotationPath: string;
+  fallbackPaths: string[];
+  migrateFallback: boolean;
+  annotationBackupPath?: string;
+}
+
+/** Pure fallback binding used when storage resolution fails entirely. */
+export function fallbackAnnotationBinding(
+  pdfPath: string,
+  options: AnnotationPathOptions
+): AnnotationBinding {
+  return {
+    annotationPath: sidecarPathFor(pdfPath, options),
+    fallbackPaths: [legacySidecarPathFor(pdfPath)],
+    migrateFallback: false,
+  };
 }
 
 function uniquePaths(paths: Array<string | null | undefined>): string[] {
@@ -75,20 +105,109 @@ function isManifest(value: unknown): value is PdfBundleManifest {
   );
 }
 
-function shouldVerify(lastVerified: string | undefined): boolean {
-  if (!lastVerified) return true;
-  const time = Date.parse(lastVerified);
-  return !Number.isFinite(time) || Date.now() - time >= BACKUP_VERIFY_INTERVAL_MS;
-}
-
 export class PdfBundleManager {
   private pendingByHash = new Map<string, Promise<PdfBundleBinding>>();
+  private hashMemo = new Map<string, string>();
   private pathToHash = new Map<string, string>();
   private legacyFingerprintIndex: Map<string, string[]> | null = null;
 
   constructor(private app: App) {}
 
-  /** Create or resolve the stable bundle before annotation state is loaded. */
+  /** Resolve where annotations live for this document, per the identity mode. */
+  async resolveBinding(
+    file: TFile,
+    pdfData: ArrayBuffer,
+    fingerprint: string | undefined,
+    options: AnnotationPathOptions
+  ): Promise<AnnotationBinding> {
+    if (options.documentIdentity === "hash") {
+      const binding = await this.prepare(file, pdfData, fingerprint, options);
+      return {
+        annotationPath: binding.annotationPath,
+        fallbackPaths: binding.fallbackAnnotationPaths,
+        migrateFallback: true,
+        annotationBackupPath: binding.annotationBackupPath,
+      };
+    }
+    return this.preparePathBinding(file, pdfData, fingerprint, options);
+  }
+
+  /**
+   * PATH mode: the canonical sidecar mirrors the PDF's vault path under the
+   * annotation folder. Existing hash bundles are offered as one-time migration
+   * sources (their annotations are copied into the path sidecar on load), and
+   * any leftover document.pdf recovery copy is deleted to reclaim space.
+   */
+  private async preparePathBinding(
+    file: TFile,
+    pdfData: ArrayBuffer,
+    fingerprint: string | undefined,
+    options: AnnotationPathOptions
+  ): Promise<AnnotationBinding> {
+    const adapter = this.app.vault.adapter;
+    const { annotationPath, backupPath } = pathModeSidecarPaths(file.path, options);
+
+    const fallbacks: string[] = [];
+    if (await adapter.exists(backupPath)) fallbacks.push(backupPath);
+    fallbacks.push(
+      ...(await this.legacyAnnotationCandidates(file.path, fingerprint, options, annotationPath))
+    );
+
+    // Hash-bundle migration + leftover-copy cleanup. Only runs while old
+    // bundle data exists; the per-session memo avoids rehashing a file that
+    // has not changed since it was last opened.
+    if (await adapter.exists(PDF_BUNDLE_LIBRARY)) {
+      try {
+        const hash = await this.hashForFile(file, pdfData);
+        const paths = pathsForHash(hash);
+        const bundleUsable = await this.annotationCandidateMatches(paths.annotationPath, fingerprint);
+        if (!(await adapter.exists(annotationPath))) {
+          if (bundleUsable) fallbacks.push(paths.annotationPath);
+          if (await adapter.exists(paths.annotationBackupPath)) {
+            fallbacks.push(paths.annotationBackupPath);
+          }
+        } else if (bundleUsable) {
+          // Upgrade path: 0.2.x kept editing the BUNDLE while the mirrored
+          // sidecar stayed frozen as a pre-migration snapshot. If the bundle
+          // is newer (or the sidecar is corrupt), promote the bundle content —
+          // otherwise the stale snapshot would silently roll annotations back.
+          const sidecarStat = await adapter.stat(annotationPath);
+          const bundleStat = await adapter.stat(paths.annotationPath);
+          const current = await adapter.read(annotationPath).catch(() => "");
+          const sidecarParses = !!parseAnnotations(current);
+          const bundleNewer =
+            !sidecarParses ||
+            ((bundleStat?.mtime ?? 0) > (sidecarStat?.mtime ?? 0));
+          if (bundleNewer) {
+            if (sidecarParses) await adapter.write(backupPath, current);
+            await adapter.write(annotationPath, await adapter.read(paths.annotationPath));
+          }
+        }
+        await this.deleteStoredCopy(paths.backupPath);
+      } catch (e) {
+        console.error("[local-pdf-annotator] hash-bundle migration check failed", e);
+      }
+    }
+
+    return {
+      annotationPath,
+      fallbackPaths: uniquePaths(fallbacks).filter((path) => path !== annotationPath),
+      migrateFallback: true,
+      annotationBackupPath: backupPath,
+    };
+  }
+
+  /** Session memo: skip rehashing an unchanged file on repeat opens. */
+  private async hashForFile(file: TFile, pdfData: ArrayBuffer): Promise<string> {
+    const stamp = `${normalizePath(file.path)}:${file.stat?.size ?? pdfData.byteLength}:${file.stat?.mtime ?? 0}`;
+    const memo = this.hashMemo.get(stamp);
+    if (memo) return memo;
+    const hash = await sha256Hex(pdfData);
+    this.hashMemo.set(stamp, hash);
+    return hash;
+  }
+
+  /** HASH mode: create or resolve the stable bundle before annotations load. */
   async prepare(
     file: TFile,
     pdfData: ArrayBuffer,
@@ -111,7 +230,7 @@ export class PdfBundleManager {
     }
   }
 
-  /** Best-effort metadata sync. Identity and recovery do not depend on it. */
+  /** Best-effort metadata sync. Identity does not depend on it. */
   async onPdfRenamed(file: TFile, oldPath: string): Promise<void> {
     const normalizedOld = normalizePath(oldPath);
     const hash = this.pathToHash.get(normalizedOld);
@@ -122,7 +241,7 @@ export class PdfBundleManager {
     if (binding) await this.touchBinding(binding, file.path, file.name, undefined, oldPath);
   }
 
-  /** Keep the recovery bundle after the working PDF is deleted. */
+  /** Keep the bundle's annotations after the working PDF is deleted. */
   async onPdfDeleted(path: string): Promise<void> {
     const normalized = normalizePath(path);
     const hash = this.pathToHash.get(normalized);
@@ -151,65 +270,105 @@ export class PdfBundleManager {
     return bundles.sort((a, b) => b.manifest.lastSeen.localeCompare(a.manifest.lastSeen));
   }
 
-  async verifyBundle(binding: PdfBundleBinding): Promise<BundleVerification> {
-    const adapter = this.app.vault.adapter;
-    try {
-      const stat = await adapter.stat(binding.backupPath);
-      if (!stat || stat.type !== "file") {
-        return { manifest: binding.manifest, ok: false, reason: "backup PDF is missing" };
-      }
-      if (stat.size !== binding.manifest.byteLength) {
-        return { manifest: binding.manifest, ok: false, reason: "backup PDF size changed" };
-      }
-      const actual = await sha256Hex(await adapter.readBinary(binding.backupPath));
-      if (actual !== binding.manifest.sha256) {
-        return { manifest: binding.manifest, ok: false, reason: "backup PDF checksum failed" };
-      }
-      binding.manifest.lastVerified = new Date().toISOString();
-      binding.manifest.updated = binding.manifest.lastVerified;
-      await this.writeManifest(binding.manifestPath, binding.manifest);
-      return { manifest: binding.manifest, ok: true };
-    } catch (error: any) {
-      return { manifest: binding.manifest, ok: false, reason: error?.message ?? String(error) };
-    }
+  /** Size up leftover document.pdf recovery copies from older releases. */
+  async statStoredPdfCopies(): Promise<StoredCopyStats> {
+    return this.sweepStoredCopies(false);
   }
 
-  async restoreBundle(
-    binding: PdfBundleBinding,
-    recoveryFolder = DEFAULT_RECOVERY_FOLDER
-  ): Promise<TFile> {
-    const verification = await this.verifyBundle(binding);
-    if (!verification.ok) throw new Error(verification.reason ?? "Backup verification failed.");
+  /** Delete leftover document.pdf copies whose working PDF still exists.
+   * A copy whose PDF is gone from the vault is the only surviving copy of
+   * that document — those are always kept and reported instead. */
+  async deleteStoredPdfCopies(): Promise<StoredCopyStats> {
+    return this.sweepStoredCopies(true);
+  }
 
-    const folder = normalizePath(recoveryFolder).replace(/^\/+|\/+$/g, "") || DEFAULT_RECOVERY_FOLDER;
-    await this.ensureFolder(folder);
-    const desiredName = binding.manifest.originalName.toLowerCase().endsWith(".pdf")
-      ? binding.manifest.originalName
-      : `${binding.manifest.originalName}.pdf`;
-    const targetPath = this.availableRecoveryPath(folder, desiredName);
-    const data = await this.app.vault.adapter.readBinary(binding.backupPath);
-    const restored = await this.app.vault.createBinary(targetPath, data);
-    await this.touchBinding(binding, restored.path, restored.name, binding.manifest.fingerprint);
-    return restored;
+  private async sweepStoredCopies(remove: boolean): Promise<StoredCopyStats> {
+    const adapter = this.app.vault.adapter;
+    const result: StoredCopyStats = { count: 0, bytes: 0, keptOrphans: 0 };
+    if (!(await adapter.exists(PDF_BUNDLE_LIBRARY))) return result;
+    const listing = await adapter.list(PDF_BUNDLE_LIBRARY);
+    for (const folder of listing.folders) {
+      const copyPath = normalizePath(`${folder}/document.pdf`);
+      const stat = await adapter.stat(copyPath);
+      if (stat?.type !== "file") continue;
+      const manifest = await this.readManifest(normalizePath(`${folder}/manifest.json`));
+      const knownPaths = uniquePaths([manifest?.currentPath, ...(manifest?.aliases ?? [])]);
+      let workingCopyExists = false;
+      for (const path of knownPaths) {
+        if (await adapter.exists(path)) {
+          workingCopyExists = true;
+          break;
+        }
+      }
+      if (!workingCopyExists) {
+        result.keptOrphans++;
+        continue;
+      }
+      result.count++;
+      result.bytes += stat.size;
+      if (remove) await adapter.remove(copyPath);
+    }
+    return result;
+  }
+
+  private async deleteStoredCopy(backupPath: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    try {
+      const stat = await adapter.stat(backupPath);
+      if (stat?.type === "file") await adapter.remove(backupPath);
+    } catch (e) {
+      console.error("[local-pdf-annotator] could not delete stored PDF copy", e);
+    }
   }
 
   /** Write a user-visible snapshot without making that path authoritative. */
-  async exportAnnotations(file: TFile, exportFolder: string): Promise<string> {
-    const data = await this.app.vault.readBinary(file);
-    const hash = await sha256Hex(data);
-    const binding = await this.readBinding(hash);
-    if (!binding || !(await this.app.vault.adapter.exists(binding.annotationPath))) {
-      throw new Error("No managed annotations exist for this PDF.");
+  async exportAnnotations(
+    file: TFile,
+    exportFolder: string,
+    options: AnnotationPathOptions = {}
+  ): Promise<string> {
+    const adapter = this.app.vault.adapter;
+    const { annotationPath } = pathModeSidecarPaths(file.path, options);
+    const pathCandidates = uniquePaths([
+      annotationPath,
+      sidecarPathFor(file.path, options),
+      legacySidecarPathFor(file.path),
+    ]);
+
+    let sourcePath: string | null = null;
+    let suffix = "";
+
+    const tryBundle = async () => {
+      const hash = await this.hashForFile(file, await this.app.vault.readBinary(file));
+      const paths = pathsForHash(hash);
+      if (await adapter.exists(paths.annotationPath)) {
+        sourcePath = paths.annotationPath;
+        suffix = `--${hash.slice(0, 12)}`;
+      }
+    };
+    const tryPaths = async () => {
+      for (const path of pathCandidates) {
+        if (await adapter.exists(path)) {
+          sourcePath = path;
+          return;
+        }
+      }
+    };
+
+    // The active identity mode owns the canonical copy; the other is fallback.
+    if (options.documentIdentity === "hash") {
+      await tryBundle();
+      if (!sourcePath) await tryPaths();
+    } else {
+      await tryPaths();
+      if (!sourcePath) await tryBundle();
     }
+    if (!sourcePath) throw new Error("No annotations exist for this PDF.");
+
     const folder = normalizePath(exportFolder).replace(/^\/+|\/+$/g, "");
     await this.ensureFolder(folder);
-    const exportPath = normalizePath(
-      `${folder}/${file.basename}--${hash.slice(0, 12)}.annotations.md`
-    );
-    await this.app.vault.adapter.write(
-      exportPath,
-      await this.app.vault.adapter.read(binding.annotationPath)
-    );
+    const exportPath = normalizePath(`${folder}/${file.basename}${suffix}.annotations.md`);
+    await adapter.write(exportPath, await adapter.read(sourcePath));
     return exportPath;
   }
 
@@ -226,24 +385,9 @@ export class PdfBundleManager {
     let manifest = await this.readManifest(paths.manifestPath);
     if (manifest?.sha256 !== hash) manifest = null;
     const now = new Date().toISOString();
-    const backupStat = await this.app.vault.adapter.stat(paths.backupPath);
-    const backupNeedsWrite =
-      !backupStat || backupStat.type !== "file" || backupStat.size !== pdfData.byteLength;
-    if (backupNeedsWrite) await this.app.vault.adapter.writeBinary(paths.backupPath, pdfData);
 
-    const needsVerification = backupNeedsWrite || !manifest || shouldVerify(manifest.lastVerified);
-    let verifiedAt = manifest?.lastVerified ?? "";
-    if (needsVerification) {
-      let actual = await sha256Hex(await this.app.vault.adapter.readBinary(paths.backupPath));
-      if (actual !== hash) {
-        // A partial/corrupt backup is repaired from the working PDF while it is
-        // still available, then verified again before annotation can proceed.
-        await this.app.vault.adapter.writeBinary(paths.backupPath, pdfData);
-        actual = await sha256Hex(await this.app.vault.adapter.readBinary(paths.backupPath));
-      }
-      if (actual !== hash) throw new Error(`Could not create a verified PDF backup for ${file.path}.`);
-      verifiedAt = now;
-    }
+    // The retired recovery-copy feature: reclaim the space on next open.
+    await this.deleteStoredCopy(paths.backupPath);
 
     manifest = manifest ?? {
       version: 1,
@@ -257,10 +401,9 @@ export class PdfBundleManager {
       created: now,
       updated: now,
       lastSeen: now,
-      lastVerified: verifiedAt || now,
+      lastVerified: now,
     };
     manifest.byteLength = pdfData.byteLength;
-    manifest.lastVerified = verifiedAt || manifest.lastVerified || now;
     await this.writeManifest(paths.manifestPath, manifest);
 
     const fallbackAnnotationPaths = await this.legacyAnnotationCandidates(
@@ -325,7 +468,7 @@ export class PdfBundleManager {
     }
 
     // A unique fingerprint match recovers an old sidecar after the PDF was
-    // already renamed or moved before this bundle system was installed.
+    // already renamed or moved before this storage system was installed.
     if (fingerprint) {
       const index = await this.getLegacyFingerprintIndex();
       const fingerprintMatches = (index.get(fingerprint) ?? []).filter(
@@ -407,18 +550,5 @@ export class PdfBundleManager {
         if ((await this.app.vault.adapter.stat(current))?.type !== "folder") throw error;
       }
     }
-  }
-
-  private availableRecoveryPath(folder: string, filename: string): string {
-    const dot = filename.toLowerCase().endsWith(".pdf") ? filename.length - 4 : filename.length;
-    const stem = filename.slice(0, dot);
-    const ext = filename.slice(dot) || ".pdf";
-    let candidate = normalizePath(`${folder}/${stem}${ext}`);
-    let n = 2;
-    while (this.app.vault.getAbstractFileByPath(candidate)) {
-      candidate = normalizePath(`${folder}/${stem} ${n}${ext}`);
-      n++;
-    }
-    return candidate;
   }
 }

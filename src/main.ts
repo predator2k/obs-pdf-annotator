@@ -9,7 +9,9 @@
  *     viewer without replacing it (see native-overlay.ts)
  */
 import {
-  FuzzySuggestModal,
+  debounce,
+  Modal,
+  Platform,
   Plugin,
   TFile,
   WorkspaceLeaf,
@@ -22,43 +24,70 @@ import { initPdfEngine, disposePdfEngine, LOG_TAG } from "./pdf-engine";
 import { NativeOverlayManager } from "./native-overlay";
 import {
   DEFAULT_ANNOTATION_FOLDER,
+  DEFAULT_PALETTE,
+  defaultColor,
+  derivePaletteEntry,
+  markStyleOf,
+  moveSidecarsForRename,
   normalizeAnnotationStorageFolder,
+  PALETTE,
+  setActivePalette,
   type AnnotationPathOptions,
   type AnnotationStorageMode,
+  type DocumentIdentityMode,
+  type MarkStyle,
+  type PenState,
 } from "./annotations";
-import {
-  DEFAULT_RECOVERY_FOLDER,
-  PDF_BUNDLE_LIBRARY,
-  PdfBundleManager,
-  type PdfBundleBinding,
-} from "./bundles";
+import { parseColor } from "./color";
+import { AnnotationHub } from "./annotation-hub";
+import { AnnotationPanelView, VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
+import { PdfBundleManager } from "./bundles";
 
 interface LpaSettings {
   /** Override Obsidian's core PDF viewer so clicking a PDF opens this view. */
   registerAsDefaultPdfHandler: boolean;
   /** Inject annotation mode into the native PDF view (experimental). */
   enableNativeOverlay: boolean;
+  /** Show margin note cards beside the pages (notes always editable via popup). */
+  showMarginCards: boolean;
+  /** How a PDF is matched to its annotations: by vault path or content hash. */
+  documentIdentity: DocumentIdentityMode;
   /** Legacy sidecar mode retained only for migration compatibility. */
   annotationStorageMode: AnnotationStorageMode;
   /** Vault-relative folder searched for legacy sidecars and used for exports. */
   annotationStorageFolder: string;
+  /** User-defined highlight colors; null/absent = built-in palette. */
+  customPalette: Array<{ name: string; fill: string; highlightAlpha?: number }> | null;
+  /** The persistent pen: last used mark color + style. */
+  lastColorFill: string | null;
+  lastMarkStyle: string | null;
 }
 
 const DEFAULT_SETTINGS: LpaSettings = {
   registerAsDefaultPdfHandler: false,
   enableNativeOverlay: true,
+  showMarginCards: false,
+  documentIdentity: "path",
   annotationStorageMode: "folder",
   annotationStorageFolder: DEFAULT_ANNOTATION_FOLDER,
+  customPalette: null,
+  lastColorFill: null,
+  lastMarkStyle: null,
 };
 
 function coerceAnnotationStorageMode(value: string): AnnotationStorageMode {
   return value === "beside-pdf" ? "beside-pdf" : "folder";
 }
 
+function coerceDocumentIdentity(value: string): DocumentIdentityMode {
+  return value === "hash" ? "hash" : "path";
+}
+
 export default class LocalPdfAnnotatorPlugin extends Plugin {
   settings!: LpaSettings;
   nativeOverlays!: NativeOverlayManager;
   bundleManager!: PdfBundleManager;
+  annotationHub = new AnnotationHub();
   private replacingCorePdfView = false;
   private nativePdfRefreshRaf: number | null = null;
 
@@ -76,14 +105,26 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.registerView(
       VIEW_TYPE_PDF_ANNOTATOR,
       (leaf: WorkspaceLeaf) =>
-        new PdfAnnotatorView(leaf, () => this.annotationPathOptions(), this.bundleManager)
+        new PdfAnnotatorView(
+          leaf,
+          () => this.annotationPathOptions(),
+          this.bundleManager,
+          () => this.settings.showMarginCards,
+          this.pen(),
+          this.annotationHub
+        )
     );
+
+    this.registerView(VIEW_TYPE_LPA_PANEL, (leaf) => new AnnotationPanelView(leaf, this.annotationHub));
 
     this.nativeOverlays = new NativeOverlayManager(
       this,
       () => this.settings.enableNativeOverlay,
       () => this.annotationPathOptions(),
-      this.bundleManager
+      this.bundleManager,
+      () => this.settings.showMarginCards,
+      this.pen(),
+      this.annotationHub
     );
 
     // Trigger 1: command palette.
@@ -132,15 +173,38 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "restore-backed-up-pdf",
-      name: "Restore a PDF from annotation backup",
+      id: "open-annotation-panel",
+      name: "Open annotations panel",
       callback: async () => {
-        const bundles = await this.bundleManager.listBundles();
-        if (!bundles.length) {
-          new Notice("PDF Annotator: no managed PDF backups found.");
+        const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_LPA_PANEL)[0];
+        if (existing) {
+          this.app.workspace.revealLeaf(existing);
           return;
         }
-        new PdfBackupRestoreModal(this, bundles).open();
+        const leaf = this.app.workspace.getRightLeaf(false);
+        if (!leaf) return;
+        await leaf.setViewState({ type: VIEW_TYPE_LPA_PANEL, active: true });
+        this.app.workspace.revealLeaf(leaf);
+      },
+    });
+
+    this.addCommand({
+      id: "delete-stored-pdf-copies",
+      name: "Delete stored PDF copies (reclaim space)",
+      callback: async () => {
+        const stats = await this.bundleManager.statStoredPdfCopies();
+        if (!stats.count && !stats.keptOrphans) {
+          new Notice("PDF Annotator: no stored PDF copies found.");
+          return;
+        }
+        if (!stats.count) {
+          new Notice(
+            `PDF Annotator: ${stats.keptOrphans} stored ${stats.keptOrphans === 1 ? "copy belongs" : "copies belong"} ` +
+              "to PDFs no longer in the vault — kept as the only surviving copies (see .pdf-annotator/)."
+          );
+          return;
+        }
+        new DeleteStoredCopiesModal(this, stats.count, stats.bytes, stats.keptOrphans).open();
       },
     });
 
@@ -152,7 +216,7 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
         if (!(file instanceof TFile) || file.extension !== "pdf") return false;
         if (!checking) {
           void this.bundleManager
-            .exportAnnotations(file, `${this.settings.annotationStorageFolder}/Exports`)
+            .exportAnnotations(file, `${this.settings.annotationStorageFolder}/Exports`, this.annotationPathOptions())
             .then((path) => new Notice(`PDF Annotator: exported ${path}`))
             .catch((e: any) => {
               console.error(`${LOG_TAG} failed to export PDF annotations`, e);
@@ -160,33 +224,6 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
             });
         }
         return true;
-      },
-    });
-
-    this.addCommand({
-      id: "verify-pdf-annotation-backups",
-      name: "Verify all PDF annotation backups",
-      callback: async () => {
-        const bundles = await this.bundleManager.listBundles();
-        if (!bundles.length) {
-          new Notice("PDF Annotator: no managed PDF backups found.");
-          return;
-        }
-        let failed = 0;
-        for (const bundle of bundles) {
-          const result = await this.bundleManager.verifyBundle(bundle);
-          if (!result.ok) {
-            failed++;
-            console.error(
-              `${LOG_TAG} backup verification failed for ${bundle.manifest.originalName}: ${result.reason}`
-            );
-          }
-        }
-        new Notice(
-          failed
-            ? `PDF Annotator: ${failed} of ${bundles.length} backups failed verification — see console.`
-            : `PDF Annotator: verified ${bundles.length} PDF backup${bundles.length === 1 ? "" : "s"}.`
-        );
       },
     });
 
@@ -202,7 +239,10 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
       })
     );
     this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => this.scheduleNativePdfRefresh())
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        this.annotationHub.setActiveFromLeaf(leaf);
+        this.scheduleNativePdfRefresh();
+      })
     );
     this.registerEvent(
       this.app.workspace.on("layout-change", () => this.scheduleNativePdfRefresh())
@@ -210,15 +250,7 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (!(file instanceof TFile) || file.extension !== "pdf") return;
-        void this.bundleManager.onPdfRenamed(file, oldPath).catch((e) =>
-          console.error(`${LOG_TAG} failed to update PDF bundle path metadata`, e)
-        );
-        for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR)) {
-          const view = leaf.view;
-          if (view instanceof PdfAnnotatorView) view.syncPdfPath(file);
-        }
-        this.nativeOverlays.syncPdfPath(file);
-        this.scheduleNativePdfRefresh();
+        void this.onPdfRenamed(file, oldPath);
       })
     );
     this.registerEvent(
@@ -286,6 +318,9 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
 
   private async openPdfClickInAnnotator(file: TFile): Promise<void> {
     if (!this.settings.registerAsDefaultPdfHandler || this.replacingCorePdfView) return;
+    // The native-viewer overlay is the mobile experience; the custom view
+    // stays reachable through its command but is not the default there.
+    if (Platform.isMobile) return;
     for (const delayMs of [-1, 0, 16, 64]) {
       if (delayMs < 0) {
         await Promise.resolve();
@@ -323,6 +358,8 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.settings.annotationStorageMode = coerceAnnotationStorageMode(
       this.settings.annotationStorageMode
     );
+    this.settings.documentIdentity = coerceDocumentIdentity(this.settings.documentIdentity);
+    this.applyPaletteFromSettings();
     this.settings.annotationStorageFolder = normalizeAnnotationStorageFolder(
       this.settings.annotationStorageFolder
     );
@@ -332,10 +369,72 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  applyPaletteFromSettings(): void {
+    const entries = this.settings.customPalette;
+    setActivePalette(
+      (entries ?? []).map((e) => {
+        // An untouched built-in color keeps its hand-tuned ink/emoji/alpha.
+        const preset = DEFAULT_PALETTE.find((p) => p.fill === e.fill);
+        return preset
+          ? { ...preset, name: e.name.trim() || preset.name }
+          : derivePaletteEntry(e.name, e.fill, e.highlightAlpha);
+      })
+    );
+  }
+
+  pen(): PenState {
+    return {
+      getColor: () => {
+        const stored = this.settings.lastColorFill;
+        return stored && PALETTE.some((p) => p.fill === stored) ? stored : defaultColor();
+      },
+      getStyle: () => markStyleOf({ style: this.settings.lastMarkStyle ?? undefined }),
+      set: (color: string, style: MarkStyle) => {
+        this.settings.lastColorFill = color;
+        this.settings.lastMarkStyle = style;
+        void this.saveSettings();
+      },
+    };
+  }
+
+  /** Rename-follow: flush, then move sidecars (path mode), then repoint views. */
+  private async onPdfRenamed(file: TFile, oldPath: string): Promise<void> {
+    const options = this.annotationPathOptions();
+    if (options.documentIdentity !== "hash") {
+      // Settle any pending debounced save first so it cannot fire mid-move
+      // and resurrect a sidecar at the old location.
+      for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR)) {
+        const view = leaf.view;
+        if (view instanceof PdfAnnotatorView) await view.flushAnnotations(file);
+      }
+      await this.nativeOverlays.flushAnnotations(file);
+      await moveSidecarsForRename(this.app.vault.adapter, oldPath, file.path, options);
+    }
+    await this.bundleManager.onPdfRenamed(file, oldPath).catch((e) =>
+      console.error(`${LOG_TAG} failed to update PDF bundle path metadata`, e)
+    );
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof PdfAnnotatorView) view.syncPdfPath(file);
+    }
+    this.nativeOverlays.syncPdfPath(file);
+    this.scheduleNativePdfRefresh();
+  }
+
+  /** Re-render annotation UI in every open view after a live setting change. */
+  refreshAnnotationUi(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof PdfAnnotatorView) view.refreshAnnotationUi();
+    }
+    this.nativeOverlays.refreshUi();
+  }
+
   annotationPathOptions(): AnnotationPathOptions {
     return {
       storageMode: this.settings.annotationStorageMode,
       storageFolder: this.settings.annotationStorageFolder,
+      documentIdentity: this.settings.documentIdentity,
     };
   }
 }
@@ -350,9 +449,11 @@ class LpaSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     new Setting(containerEl)
-      .setName("Legacy annotation folder")
+      .setName("Annotation folder")
       .setDesc(
-        `Existing path-based sidecars are imported from this folder. New annotations and a verified PDF backup are kept together in ${PDF_BUNDLE_LIBRARY}.`
+        "Annotation sidecars are stored in this folder, mirroring each PDF's vault path " +
+          "(e.g. Books/Novel.pdf → PDF annotations/Books/Novel.annotations.md). " +
+          "Exports also land here."
       )
       .addText((t) => {
         t
@@ -363,6 +464,25 @@ class LpaSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Match annotations to PDFs by")
+      .setDesc(
+        "File path (default): fast opens, annotations survive edits to the PDF's contents, and " +
+          "renames done inside Obsidian are tracked. Content hash: robust against moves and " +
+          "renames done outside Obsidian, but an edited PDF counts as a new document and every " +
+          "open reads and hashes the whole file. Applies the next time a PDF is opened."
+      )
+      .addDropdown((d) =>
+        d
+          .addOption("path", "File path (recommended)")
+          .addOption("hash", "Content hash")
+          .setValue(this.plugin.settings.documentIdentity)
+          .onChange(async (v) => {
+            this.plugin.settings.documentIdentity = v === "hash" ? "hash" : "path";
+            await this.plugin.saveSettings();
+          })
+      );
 
     new Setting(containerEl)
       .setName("Annotate inside the native PDF view (experimental)")
@@ -377,6 +497,21 @@ class LpaSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           if (v) this.plugin.nativeOverlays.refresh();
           else this.plugin.nativeOverlays.disable();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Show margin note cards")
+      .setDesc(
+        "Show annotation cards beside the pages, in whatever margin space already exists. " +
+          "Off by default: notes are read and edited in a popup on the mark itself. " +
+          "The PDF zoom level is never changed automatically."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showMarginCards).onChange(async (v) => {
+          this.plugin.settings.showMarginCards = v;
+          await this.plugin.saveSettings();
+          this.plugin.refreshAnnotationUi();
         })
       );
 
@@ -399,42 +534,146 @@ class LpaSettingTab extends PluginSettingTab {
       text:
         "The command “Open current PDF in annotator” remains available as a stable custom-view fallback.",
     });
+
+    this.displayPaletteSection(containerEl);
+  }
+
+  private displayPaletteSection(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Highlight colors").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Colors offered by the highlight pickers. Existing marks keep the color they were " +
+        "made with, even if it is removed here.",
+    });
+
+    const palette =
+      this.plugin.settings.customPalette ??
+      DEFAULT_PALETTE.map((p) => ({ name: p.name, fill: p.fill, highlightAlpha: p.highlightAlpha }));
+    const commit = async (structural: boolean) => {
+      this.plugin.settings.customPalette = palette;
+      await this.plugin.saveSettings();
+      this.plugin.applyPaletteFromSettings();
+      this.plugin.refreshAnnotationUi();
+      if (structural) this.display();
+    };
+    // Renames don't change how marks render — no repaint, and saves are
+    // debounced so typing a name isn't a disk write per keystroke.
+    const commitNameDebounced = debounce(
+      () => {
+        this.plugin.settings.customPalette = palette;
+        void this.plugin.saveSettings().then(() => this.plugin.applyPaletteFromSettings());
+      },
+      800,
+      true
+    );
+
+    palette.forEach((entry, index) => {
+      const row = new Setting(containerEl);
+      row.addText((t) =>
+        t
+          .setPlaceholder("Name")
+          .setValue(entry.name)
+          .onChange((v) => {
+            entry.name = v;
+            commitNameDebounced();
+          })
+      );
+      row.addColorPicker((c) =>
+        c.setValue(fillToHex(entry.fill)).onChange(async (v) => {
+          entry.fill = v;
+          delete entry.highlightAlpha;
+          await commit(false);
+        })
+      );
+      row.addExtraButton((b) =>
+        b
+          .setIcon("trash")
+          .setTooltip(palette.length <= 1 ? "At least one color is required" : "Remove color")
+          .setDisabled(palette.length <= 1)
+          .onClick(async () => {
+            palette.splice(index, 1);
+            await commit(true);
+          })
+      );
+    });
+
+    new Setting(containerEl)
+      .addButton((b) =>
+        b.setButtonText("Add color").onClick(async () => {
+          palette.push({ name: `color ${palette.length + 1}`, fill: "#4A90D9" });
+          await commit(true);
+        })
+      )
+      .addButton((b) =>
+        b.setButtonText("Restore defaults").onClick(async () => {
+          this.plugin.settings.customPalette = null;
+          await this.plugin.saveSettings();
+          this.plugin.applyPaletteFromSettings();
+          this.plugin.refreshAnnotationUi();
+          this.display();
+        })
+      );
   }
 }
 
-class PdfBackupRestoreModal extends FuzzySuggestModal<PdfBundleBinding> {
+function fillToHex(fill: string): string {
+  const c = parseColor(fill);
+  if (!c) return "#ffd400";
+  const hex = (v: number) => v.toString(16).padStart(2, "0");
+  return `#${hex(c.r)}${hex(c.g)}${hex(c.b)}`;
+}
+
+class DeleteStoredCopiesModal extends Modal {
   constructor(
     private plugin: LocalPdfAnnotatorPlugin,
-    private bundles: PdfBundleBinding[]
+    private count: number,
+    private bytes: number,
+    private keptOrphans: number
   ) {
     super(plugin.app);
-    this.setPlaceholder("Choose a backed-up PDF to restore");
   }
 
-  getItems(): PdfBundleBinding[] {
-    return this.bundles;
-  }
-
-  getItemText(binding: PdfBundleBinding): string {
-    const path = binding.manifest.currentPath ?? "working copy deleted";
-    return `${binding.manifest.originalName} — ${path}`;
-  }
-
-  onChooseItem(binding: PdfBundleBinding): void {
-    void this.restore(binding);
-  }
-
-  private async restore(binding: PdfBundleBinding): Promise<void> {
-    try {
-      const file = await this.plugin.bundleManager.restoreBundle(
-        binding,
-        DEFAULT_RECOVERY_FOLDER
-      );
-      new Notice(`PDF Annotator: restored ${file.path}`);
-      await this.plugin.openInAnnotator(file, "tab");
-    } catch (e: any) {
-      console.error(`${LOG_TAG} failed to restore PDF backup`, e);
-      new Notice(`PDF Annotator: restore failed — ${e?.message ?? e}`);
+  onOpen(): void {
+    const mb = (this.bytes / (1024 * 1024)).toFixed(1);
+    this.titleEl.setText("Delete stored PDF copies");
+    this.contentEl.createEl("p", {
+      text:
+        `Older versions of PDF Annotator kept a recovery copy of each annotated PDF inside ` +
+        `.pdf-annotator/. ${this.count} ${this.count === 1 ? "copy" : "copies"} (${mb} MB) ` +
+        `whose working PDFs still exist can be deleted. Annotations are not touched, and your ` +
+        `working PDFs are never affected.`,
+    });
+    if (this.keptOrphans > 0) {
+      this.contentEl.createEl("p", {
+        text:
+          `${this.keptOrphans} ${this.keptOrphans === 1 ? "copy" : "copies"} will be KEPT because ` +
+          `no working PDF exists for ${this.keptOrphans === 1 ? "it" : "them"} anywhere in the ` +
+          `vault — deleting those would destroy the only surviving copy of the document.`,
+      });
     }
+    const buttons = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const del = buttons.createEl("button", { cls: "mod-warning", text: `Delete ${this.count} ${this.count === 1 ? "copy" : "copies"}` });
+    del.onclick = async () => {
+      del.disabled = true;
+      try {
+        const { count, bytes, keptOrphans } = await this.plugin.bundleManager.deleteStoredPdfCopies();
+        new Notice(
+          `PDF Annotator: deleted ${count} stored ${count === 1 ? "copy" : "copies"} ` +
+            `(${(bytes / (1024 * 1024)).toFixed(1)} MB reclaimed)` +
+            (keptOrphans ? `; kept ${keptOrphans} sole-surviving ${keptOrphans === 1 ? "copy" : "copies"}.` : ".")
+        );
+      } catch (e: any) {
+        console.error(`${LOG_TAG} failed to delete stored PDF copies`, e);
+        new Notice(`PDF Annotator: cleanup failed — ${e?.message ?? e}`);
+      }
+      this.close();
+    };
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => this.close();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }

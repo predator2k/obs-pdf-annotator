@@ -10,6 +10,7 @@
  */
 import type { DataAdapter } from "obsidian";
 import { debounce, normalizePath } from "obsidian";
+import { clampCssAlpha, deriveEmoji, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha, type Rgba } from "./color";
 
 export interface PdfRect {
   // PDF user space (same convention as viewport.convertToPdfPoint).
@@ -90,12 +91,31 @@ export interface AnnotationDoc {
 
 export type AnnotationStorageMode = "folder" | "beside-pdf";
 
+/**
+ * How a PDF is matched to its annotations.
+ *  - "path" (default): the sidecar location is derived from the PDF's vault
+ *    path. No hashing at open; annotations survive content edits; renames done
+ *    inside Obsidian move the sidecar along.
+ *  - "hash": the SHA-256 of the PDF bytes is the identity. Robust against
+ *    moves/renames done outside Obsidian, but an edited PDF becomes a new
+ *    document and every open reads + hashes the full file.
+ */
+export type DocumentIdentityMode = "path" | "hash";
+
 export interface AnnotationPathOptions {
   storageMode?: AnnotationStorageMode;
   storageFolder?: string;
+  documentIdentity?: DocumentIdentityMode;
 }
 
 export const DEFAULT_ANNOTATION_FOLDER = "PDF annotations";
+
+/** The persistent "pen": last used color + style, shared by both PDF modes. */
+export interface PenState {
+  getColor(): string;
+  getStyle(): MarkStyle;
+  set(color: string, style: MarkStyle): void;
+}
 
 /**
  * The COLOR/meaning palette. Fills should read like real marker/pen colors,
@@ -111,25 +131,128 @@ export interface PaletteEntry {
   highlightAlpha?: number; // optional painted alpha for marker-like fills
 }
 
-export const PALETTE: PaletteEntry[] = [
-  {
-    name: "yellow",
-    fill: "#FBF719",
-    ink: "rgba(190, 135, 0, 0.96)",
-    emoji: "🟨",
-    cardFill: "rgba(255, 224, 46, 0.52)",
-    highlightAlpha: 0.52,
-  },
-  { name: "blue", fill: "rgba(72, 158, 255, 0.42)", ink: "rgba(28, 104, 196, 0.96)", emoji: "🟦" },
-  { name: "pink", fill: "rgba(255, 76, 174, 0.46)", ink: "rgba(202, 32, 122, 0.96)", emoji: "🟪" },
-  { name: "red", fill: "rgba(246, 94, 82, 0.44)", ink: "rgba(188, 54, 45, 0.96)", emoji: "🟥" },
-];
+/** Defaults follow Zotero's reader palette, familiar from academic workflows. */
+const presetColor = (name: string, fill: string): PaletteEntry =>
+  Object.freeze(derivePaletteEntry(name, fill));
 
-/** name → fill, kept for any code that wants the simple map. */
-export const HL_COLORS: Record<string, string> = Object.fromEntries(
-  PALETTE.map((p) => [p.name, p.fill])
-);
-export const DEFAULT_COLOR = PALETTE[0].fill;
+export const DEFAULT_PALETTE: readonly PaletteEntry[] = Object.freeze([
+  presetColor("yellow", "#ffd400"),
+  presetColor("red", "#ff6666"),
+  presetColor("green", "#5fb236"),
+  presetColor("blue", "#2ea8e5"),
+  presetColor("purple", "#a28ae5"),
+  presetColor("magenta", "#e56eee"),
+  presetColor("orange", "#f19837"),
+  presetColor("gray", "#aaaaaa"),
+]);
+
+/**
+ * The LIVE palette. Kept as one mutable array instance (mutated in place by
+ * setActivePalette) so every consumer that iterates PALETTE — swatch rows,
+ * renderers, resolvePalette — picks up user-configured colors without any
+ * call-site changes. Swatch DOM is rebuilt on every popover open, so changes
+ * apply immediately.
+ */
+export const PALETTE: PaletteEntry[] = DEFAULT_PALETTE.map((p) => ({ ...p }));
+
+/** Replace the live palette in place (settings load / palette edits). */
+export function setActivePalette(entries: PaletteEntry[]): void {
+  const next = entries.length ? entries : DEFAULT_PALETTE.map((p) => ({ ...p }));
+  PALETTE.splice(0, PALETTE.length, ...next);
+}
+
+/** Build a full palette entry from just a name + fill (user-defined colors). */
+export function derivePaletteEntry(
+  name: string,
+  fill: string,
+  highlightAlpha?: number
+): PaletteEntry {
+  return {
+    name: name.trim() || fill,
+    fill,
+    ink: markInkColor(fill),
+    emoji: deriveEmoji(fill),
+    cardFill: withAlpha(fill, 0.5),
+    highlightAlpha,
+  };
+}
+
+export function defaultColor(): string {
+  return PALETTE[0].fill;
+}
+
+/** Fill color for a highlight: normalized to the palette, alpha-capped so
+ * stacked fills can't darken into a muddy patch and text stays readable. */
+export function highlightPaintColor(color: string): string {
+  const pal = resolvePalette(color);
+  const fill = pal?.fill ?? color;
+  const c = parseColor(fill);
+  if (!c) return fill;
+  const a = baseHighlightAlpha(c, pal);
+  return `rgba(${c.r}, ${c.g}, ${c.b}, ${clampCssAlpha(a)})`;
+}
+
+export function activeHighlightPaintColor(color: string): string {
+  const c = highlightBaseColor(color);
+  if (!c) return highlightPaintColor(color);
+  return `rgba(${c.r}, ${c.g}, ${c.b}, ${activeHighlightAlpha(c)})`;
+}
+
+export function activeHighlightGlossColor(color: string): string {
+  const c = highlightBaseColor(color);
+  if (!c) return highlightPaintColor(color);
+  const a = clampCssAlpha(activeHighlightAlpha(c) * 0.76);
+  return `rgba(${c.r}, ${c.g}, ${c.b}, ${a})`;
+}
+
+export function activeHighlightBridgeColor(color: string): string {
+  const c = highlightBaseColor(color);
+  if (!c) return highlightPaintColor(color);
+  // Inter-line connector. Lighter than the text band, but present enough that
+  // a multi-line passage reads as one continuous chunk of ink.
+  const a = clampCssAlpha(activeHighlightAlpha(c) * 0.5);
+  return `rgba(${c.r}, ${c.g}, ${c.b}, ${a})`;
+}
+
+function highlightBaseColor(color: string): Rgba | null {
+  const pal = resolvePalette(color);
+  const fill = pal?.fill ?? color;
+  const parsed = parseColor(fill);
+  if (!parsed) return null;
+  return { ...parsed, a: baseHighlightAlpha(parsed, pal) };
+}
+
+function baseHighlightAlpha(color: Rgba, pal: PaletteEntry | null): number {
+  return pal?.highlightAlpha ?? Math.min(color.a === 1 ? MAX_HIGHLIGHT_ALPHA : color.a, MAX_HIGHLIGHT_ALPHA);
+}
+
+function activeHighlightAlpha(color: Rgba): number {
+  // Emphasis is the SAME hue, just denser ink. The highlight layer is
+  // multiply-blended, so glyphs stay black at any alpha.
+  return clampCssAlpha(Math.min(0.85, Math.max(color.a + 0.2, color.a * 1.4)));
+}
+
+/**
+ * Accent color for UI chrome bound to a mark (tag dots, card edges, list
+ * accents). Light theme wants the darkened ink for contrast on white; dark
+ * theme wants the SATURATED color — darkened ink turns to mud there.
+ */
+export function annotationAccent(color: string): string {
+  const dark = typeof document !== "undefined" && document.body.classList.contains("theme-dark");
+  const pal = resolvePalette(color);
+  if (dark) return withAlpha(pal?.fill ?? color, 0.95);
+  return pal?.ink ?? markInkColor(color);
+}
+
+/**
+ * Stroke color for line/box styles: the SATURATED mark color (Zotero-style),
+ * not the darkened `ink` (which is for UI accents on light surfaces). An
+ * underline made with yellow must look yellow, not brown.
+ */
+export function markStrokeColor(color: string): string {
+  const pal = resolvePalette(color);
+  return withAlpha(pal?.fill ?? color, 0.92);
+}
 
 /**
  * Old/pre-refinement fills → current palette name. Lets legacy marks render
@@ -140,11 +263,15 @@ const LEGACY_FILL_TO_NAME: Record<string, string> = {
   "rgba(255, 214, 0, 0.40)": "yellow",
   "rgba(232, 194, 76, 0.42)": "yellow",
   "rgba(255, 224, 46, 0.52)": "yellow",
-  "rgba(106, 217, 126, 0.42)": "blue",
-  "rgba(124, 178, 122, 0.42)": "blue",
+  "#FBF719": "yellow",
+  "rgba(106, 217, 126, 0.42)": "green",
+  "rgba(124, 178, 122, 0.42)": "green",
   "rgba(90, 170, 255, 0.40)": "blue",
-  "rgba(255, 130, 200, 0.42)": "pink",
+  "rgba(72, 158, 255, 0.42)": "blue",
+  "rgba(255, 130, 200, 0.42)": "magenta",
+  "rgba(255, 76, 174, 0.46)": "magenta",
   "rgba(255, 110, 110, 0.42)": "red",
+  "rgba(246, 94, 82, 0.44)": "red",
 };
 
 /**
@@ -171,7 +298,7 @@ export function newId(): string {
 }
 
 function colorEmoji(color: string): string {
-  return resolvePalette(color)?.emoji ?? "🟨";
+  return resolvePalette(color)?.emoji ?? deriveEmoji(color);
 }
 
 function pdfAnnotationStem(pdfVaultPath: string): string {
@@ -205,6 +332,104 @@ export function sidecarPathFor(
     return normalizePath(`${folder}/${pdfAnnotationStem(pdfVaultPath)}.annotations.md`);
   }
   return legacySidecarPathFor(pdfVaultPath);
+}
+
+/**
+ * Canonical sidecar + rolling-backup locations for PATH identity mode. Always
+ * folder-mode: the legacy "beside-pdf" layout stays a migration source only.
+ */
+export function pathModeSidecarPaths(
+  pdfVaultPath: string,
+  options: AnnotationPathOptions = {}
+): { annotationPath: string; backupPath: string } {
+  const annotationPath = sidecarPathFor(pdfVaultPath, {
+    storageMode: "folder",
+    storageFolder: options.storageFolder,
+  });
+  return {
+    annotationPath,
+    backupPath: annotationPath.replace(/\.annotations\.md$/, ".annotations.previous.md"),
+  };
+}
+
+/** Create every missing parent folder of a file path (adapter-level). */
+export async function ensureFolderForFile(adapter: DataAdapter, filePath: string): Promise<void> {
+  const parent = normalizePath(filePath).split("/").slice(0, -1).join("/");
+  if (!parent) return;
+
+  const parts = parent.split("/").filter(Boolean);
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    const stat = await adapter.stat(current);
+    if (stat?.type === "folder") continue;
+    if (stat) throw new Error(`Cannot create annotation folder because ${current} is a file.`);
+    try {
+      await adapter.mkdir(current);
+    } catch (e) {
+      const after = await adapter.stat(current);
+      if (after?.type !== "folder") throw e;
+    }
+  }
+}
+
+/**
+ * PATH mode rename-follow: move the sidecar (and its rolling backup) to the
+ * location mirrored from the PDF's new vault path. A file already at the
+ * destination is never overwritten — the old sidecar stays as a recovery
+ * snapshot and a warning is logged.
+ */
+export async function moveSidecarsForRename(
+  adapter: DataAdapter,
+  oldPdfPath: string,
+  newPdfPath: string,
+  options: AnnotationPathOptions = {}
+): Promise<void> {
+  const from = pathModeSidecarPaths(oldPdfPath, options);
+  const to = pathModeSidecarPaths(newPdfPath, options);
+  if (from.annotationPath === to.annotationPath) return;
+
+  // A sidecar already at the destination belongs to a DIFFERENT document that
+  // once lived at the new path. It must not stay there (the renamed PDF's
+  // store will save there next), and it must not be overwritten silently —
+  // set it aside as a timestamped conflict snapshot.
+  try {
+    if (
+      (await adapter.exists(from.annotationPath)) &&
+      (await adapter.exists(to.annotationPath))
+    ) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const aside = to.annotationPath.replace(
+        /\.annotations\.md$/,
+        `.annotations.conflict-${stamp}.md`
+      );
+      await adapter.rename(to.annotationPath, aside);
+      console.warn(
+        `[local-pdf-annotator] a different document's sidecar occupied ${to.annotationPath}; preserved it as ${aside}`
+      );
+    }
+    if ((await adapter.exists(from.backupPath)) && (await adapter.exists(to.backupPath))) {
+      // Rolling backups are disposable; the incoming one wins.
+      await adapter.remove(to.backupPath);
+    }
+  } catch (e) {
+    console.error("[local-pdf-annotator] failed to set aside conflicting sidecar", e);
+  }
+
+  const moves: Array<[string, string]> = [
+    [from.annotationPath, to.annotationPath],
+    [from.backupPath, to.backupPath],
+  ];
+  for (const [src, dst] of moves) {
+    try {
+      if (!(await adapter.exists(src))) continue;
+      if (await adapter.exists(dst)) continue; // set-aside failed; leave both
+      await ensureFolderForFile(adapter, dst);
+      await adapter.rename(src, dst);
+    } catch (e) {
+      console.error(`[local-pdf-annotator] failed to move sidecar ${src} -> ${dst}`, e);
+    }
+  }
 }
 
 export function serializeAnnotations(doc: AnnotationDoc, pdfBasename: string): string {
@@ -273,6 +498,8 @@ export function parseAnnotations(content: string): AnnotationDoc | null {
  */
 export class AnnotationStore {
   doc: AnnotationDoc;
+  /** Fired on every store mutation (single choke point: markDirty). */
+  onChange: (() => void) | null = null;
   private dirty = false;
   private flushDebounced: () => void;
 
@@ -304,6 +531,12 @@ export class AnnotationStore {
         /* try the next candidate path */
       }
       if (!parsed) continue;
+      if (parsed.fingerprint && this.doc.fingerprint && parsed.fingerprint !== this.doc.fingerprint) {
+        console.warn(
+          `[local-pdf-annotator] sidecar ${path} was written for a different PDF fingerprint — ` +
+            "keeping it attached (path identity tolerates content edits)."
+        );
+      }
       this.doc.highlights = parsed.highlights;
       if (parsed.fingerprint) this.doc.fingerprint = parsed.fingerprint;
       // Managed bundles use a stable canonical sidecar. When annotations are
@@ -353,8 +586,8 @@ export class AnnotationStore {
     }
   }
 
-  /** Keep human-readable metadata current after a vault rename. The sidecar
-   * itself is stable and does not move when it belongs to a managed bundle. */
+  /** Keep human-readable metadata current after a vault rename. In hash mode
+   * the sidecar itself is stable; in path mode setSidecarPath follows it. */
   setPdfPath(pdfVaultPath: string, pdfBasename: string): void {
     if (this.doc.pdf === pdfVaultPath && this.pdfBasename === pdfBasename) return;
     this.doc.pdf = pdfVaultPath;
@@ -362,9 +595,16 @@ export class AnnotationStore {
     this.markDirty();
   }
 
+  /** Point future saves at a new sidecar location (path-mode rename-follow). */
+  setSidecarPath(path: string, backupPath?: string): void {
+    this.sidecarPath = path;
+    this.sidecarBackupPath = backupPath;
+  }
+
   private markDirty(): void {
     this.dirty = true;
     this.flushDebounced();
+    this.onChange?.();
   }
 
   async flush(): Promise<void> {
@@ -392,22 +632,6 @@ export class AnnotationStore {
   }
 
   private async ensureParentFolder(filePath: string): Promise<void> {
-    const parent = normalizePath(filePath).split("/").slice(0, -1).join("/");
-    if (!parent) return;
-
-    const parts = parent.split("/").filter(Boolean);
-    let current = "";
-    for (const part of parts) {
-      current = current ? `${current}/${part}` : part;
-      const stat = await this.adapter.stat(current);
-      if (stat?.type === "folder") continue;
-      if (stat) throw new Error(`Cannot create annotation folder because ${current} is a file.`);
-      try {
-        await this.adapter.mkdir(current);
-      } catch (e) {
-        const after = await this.adapter.stat(current);
-        if (after?.type !== "folder") throw e;
-      }
-    }
+    await ensureFolderForFile(this.adapter, filePath);
   }
 }

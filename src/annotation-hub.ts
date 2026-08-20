@@ -1,0 +1,62 @@
+/**
+ * annotation-hub.ts — broker between annotation sources (open PDFs in either
+ * mode) and consumers like the sidebar panel. Each mode owns its own
+ * AnnotationStore; the hub only tracks which one is "active" and relays
+ * change events, so the panel never touches mode internals.
+ */
+import { Events, TFile, WorkspaceLeaf } from "obsidian";
+import type { AnnotationStore } from "./annotations";
+
+export interface AnnotationSource {
+  key: string;
+  file: TFile;
+  store: AnnotationStore;
+  reveal(id: string): void | Promise<void>;
+  remove(id: string): void;
+  copyLink?(id: string): void | Promise<void>;
+  ownsLeaf(leaf: WorkspaceLeaf): boolean;
+}
+
+export class AnnotationHub extends Events {
+  private sources = new Map<string, AnnotationSource>();
+  private activeKey: string | null = null;
+
+  register(src: AnnotationSource): void {
+    this.sources.set(src.key, src);
+    src.store.onChange = () => this.trigger("annotations-changed", src);
+    // A freshly opened document becomes the active one.
+    this.activeKey = src.key;
+    this.trigger("active-changed");
+  }
+
+  unregister(key: string): void {
+    const src = this.sources.get(key);
+    if (!src) return;
+    src.store.onChange = null;
+    this.sources.delete(key);
+    if (this.activeKey === key) {
+      const remaining = [...this.sources.keys()];
+      this.activeKey = remaining.length ? remaining[remaining.length - 1] : null;
+    }
+    this.trigger("active-changed");
+  }
+
+  /** Sticky: focusing a non-source leaf (the panel itself, a note) keeps the
+   * last active PDF, so the panel doesn't blank out while you write. */
+  setActiveFromLeaf(leaf: WorkspaceLeaf | null): void {
+    if (!leaf) return;
+    for (const [key, src] of this.sources) {
+      if (src.ownsLeaf(leaf)) {
+        if (this.activeKey !== key) {
+          this.activeKey = key;
+          this.trigger("active-changed");
+        }
+        return;
+      }
+    }
+  }
+
+  get active(): AnnotationSource | null {
+    return this.activeKey ? this.sources.get(this.activeKey) ?? null : null;
+  }
+}
