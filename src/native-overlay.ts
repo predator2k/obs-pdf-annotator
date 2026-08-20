@@ -374,6 +374,7 @@ export class NativePdfOverlay {
   private sidebarViewEl: HTMLElement | null = null;
   private sidebarActive = false;
   private menuObserver: MutationObserver | null = null;
+  private sidebarMenuTriggerEl: HTMLElement | null = null;
   private toolbarStylesEl: HTMLElement | null = null;
   private tagBtn: HTMLButtonElement | null = null;
   private listBtn: HTMLButtonElement | null = null;
@@ -636,6 +637,7 @@ export class NativePdfOverlay {
     if (this.destroyed) return;
     this.ensureFitWidthButton();
     const sidebarOk = this.ensureSidebarTab();
+    if (sidebarOk) this.ensureSidebarMenuIntercept();
     // The list lives in the sidebar-options menu; the standalone button exists
     // only as a fallback while the native sidebar internals are unavailable
     // (they can appear a beat after the toolbar — drop the button then).
@@ -789,6 +791,76 @@ export class NativePdfOverlay {
     return true;
   }
 
+  /**
+   * Obsidian shows the sidebar options as a NATIVE OS menu on some platforms —
+   * no DOM exists to extend (verified on macOS). Take over the trigger: a
+   * capture-phase listener suppresses the native menu and shows an identical
+   * Obsidian menu with Annotations as the third choice.
+   */
+  private ensureSidebarMenuIntercept(): void {
+    const trigger = this.nativeViewer()?.toolbar?.sidebarOptionsEl as HTMLElement | undefined;
+    if (!trigger?.isConnected || trigger === this.sidebarMenuTriggerEl) return;
+    this.sidebarMenuTriggerEl = trigger;
+    const handler = (evt: Event) => {
+      if (this.destroyed) return;
+      evt.preventDefault();
+      evt.stopImmediatePropagation();
+      this.showSidebarMenu(trigger);
+    };
+    trigger.addEventListener("click", handler, { capture: true });
+    this.cleanups.push(() => {
+      trigger.removeEventListener("click", handler, { capture: true });
+      if (this.sidebarMenuTriggerEl === trigger) this.sidebarMenuTriggerEl = null;
+    });
+  }
+
+  private showSidebarMenu(anchor: HTMLElement): void {
+    const v = this.nativeViewer();
+    const sidebar = v?.pdfSidebar;
+    if (!sidebar) return;
+    const menu = new Menu();
+    const oursActive = this.sidebarActive;
+    menu.addItem((item) =>
+      item
+        .setTitle("Thumbnails")
+        .setChecked(!oursActive && sidebar.active === 1)
+        .onClick(() => {
+          this.setSidebarAnnotationsActive(false);
+          sidebar.switchView?.(1, true);
+        })
+    );
+    if (sidebar.haveOutline) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Table of contents")
+          .setChecked(!oursActive && sidebar.active === 2)
+          .onClick(() => {
+            this.setSidebarAnnotationsActive(false);
+            sidebar.switchView?.(2, true);
+          })
+      );
+    }
+    menu.addItem((item) =>
+      item
+        .setTitle("Annotations")
+        .setChecked(oursActive)
+        .onClick(() => this.setSidebarAnnotationsActive(true))
+    );
+    if (sidebar.haveOutline) {
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item.setTitle("Reveal page in table of contents").onClick(() => {
+          this.setSidebarAnnotationsActive(false);
+          sidebar.switchView?.(2, true);
+          const page = v?.pdfViewer?.currentPageNumber ?? v?.toolbar?.pageNumber;
+          if (typeof page === "number") v?.pdfOutlineViewer?.setPageNumber?.(page);
+        })
+      );
+    }
+    const rect = anchor.getBoundingClientRect();
+    menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+  }
+
   /** Inject "Annotations" into the native sidebar dropdown menu (the one with
    * Thumbnails / Table of contents) whenever it opens. Two independent hooks
    * because the menu's mount point is not contractual: a subtree observer on
@@ -824,6 +896,7 @@ export class NativePdfOverlay {
   private maybeExtendSidebarMenu(menuEl: HTMLElement): void {
     if (this.destroyed || menuEl.querySelector(".lpa-menu-annotations")) return;
     const items = Array.from(menuEl.querySelectorAll<HTMLElement>(".menu-item"));
+    if (items.some((el) => el.textContent?.trim() === "Annotations")) return;
     const thumbs = items.find((el) => el.textContent?.includes("Thumbnails"));
     const outline = items.find((el) => el.textContent?.includes("Table of contents"));
     if (!thumbs) return; // some other menu
