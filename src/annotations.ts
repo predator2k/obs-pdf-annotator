@@ -108,7 +108,9 @@ export interface AnnotationPathOptions {
   documentIdentity?: DocumentIdentityMode;
 }
 
-export const DEFAULT_ANNOTATION_FOLDER = "PDF annotations";
+export const DEFAULT_ANNOTATION_FOLDER = ".pdf-annotate";
+/** Pre-0.3.x default; kept as a migration source and auto-upgraded in settings. */
+export const LEGACY_DEFAULT_ANNOTATION_FOLDER = "PDF annotations";
 
 /** The persistent "pen": last used color + style, shared by both PDF modes. */
 export interface PenState {

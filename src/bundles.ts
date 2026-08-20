@@ -25,6 +25,7 @@
  */
 import { App, TFile, normalizePath } from "obsidian";
 import {
+  LEGACY_DEFAULT_ANNOTATION_FOLDER,
   legacySidecarPathFor,
   parseAnnotations,
   pathModeSidecarPaths,
@@ -458,9 +459,17 @@ export class PdfBundleManager {
       storageMode: "folder",
       storageFolder: options.storageFolder,
     });
+    // The old default folder remains a migration source even after the
+    // setting auto-upgrades to the hidden default.
+    const legacyCentral = sidecarPathFor(pdfPath, {
+      storageMode: "folder",
+      storageFolder: LEGACY_DEFAULT_ANNOTATION_FOLDER,
+    });
     const configured = sidecarPathFor(pdfPath, options);
     const beside = legacySidecarPathFor(pdfPath);
-    const direct = uniquePaths([configured, central, beside]).filter((path) => path !== canonicalPath);
+    const direct = uniquePaths([configured, central, legacyCentral, beside]).filter(
+      (path) => path !== canonicalPath
+    );
 
     const existing: string[] = [];
     for (const path of direct) {

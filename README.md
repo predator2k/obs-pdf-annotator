@@ -131,7 +131,7 @@ working PDF itself is never modified.
 
 - **File path** (default): the sidecar lives in the annotation folder,
   mirroring the PDF's vault path — `Books/Novel.pdf` →
-  `PDF annotations/Books/Novel.annotations.md`. Opening is fast (no hashing in
+  `.pdf-annotate/Books/Novel.annotations.md`. Opening is fast (no hashing in
   fresh vaults; vaults upgraded from 0.2.x hash once per open while old bundle
   data remains, to keep migrations safe), annotations survive edits to the
   PDF's contents, and renaming or moving the PDF inside Obsidian moves the
@@ -201,7 +201,7 @@ PDF Annotator.
 - **Toggle annotation mode on the native PDF view**
 - **Open annotations panel**
 - **Export annotations for current PDF** — snapshot under
-  `PDF annotations/Exports/`
+  `.pdf-annotate/Exports/`
 - **Delete stored PDF copies (reclaim space)** — removes 0.2.x-era duplicates
   (copies whose PDF no longer exists anywhere in the vault are kept, since they
   are the only surviving copy of that document)

@@ -24,6 +24,7 @@ import { initPdfEngine, disposePdfEngine, LOG_TAG } from "./pdf-engine";
 import { NativeOverlayManager } from "./native-overlay";
 import {
   DEFAULT_ANNOTATION_FOLDER,
+  LEGACY_DEFAULT_ANNOTATION_FOLDER,
   DEFAULT_PALETTE,
   defaultColor,
   derivePaletteEntry,
@@ -366,6 +367,10 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.settings.annotationStorageFolder = normalizeAnnotationStorageFolder(
       this.settings.annotationStorageFolder
     );
+    // Auto-upgrade installs that never customized the old visible default.
+    if (this.settings.annotationStorageFolder === LEGACY_DEFAULT_ANNOTATION_FOLDER) {
+      this.settings.annotationStorageFolder = DEFAULT_ANNOTATION_FOLDER;
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -460,7 +465,8 @@ class LpaSettingTab extends PluginSettingTab {
       .setName("Annotation folder")
       .setDesc(
         "Annotation sidecars are stored in this folder, mirroring each PDF's vault path " +
-          "(e.g. Books/Novel.pdf → PDF annotations/Books/Novel.annotations.md). " +
+          "(e.g. Books/Novel.pdf → .pdf-annotate/Books/Novel.annotations.md). The default is " +
+          "hidden from the file explorer; make sure your sync/backup tool includes it. " +
           "Exports also land here."
       )
       .addText((t) => {
