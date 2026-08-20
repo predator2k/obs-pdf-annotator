@@ -738,11 +738,14 @@ export class NativePdfOverlay {
     this.fitWidthBtn = btn;
 
     // The native control right after zoom-in cycles fit-height/fit-width; a
-    // dedicated fit-width button makes it redundant. Hide it only when it is
-    // recognizably that control, and restore it on teardown.
+    // dedicated fit-width button makes it redundant. Recognize it by label or
+    // by its chevron icon, hide it, and restore it on teardown.
     const next = btn.nextElementSibling as HTMLElement | null;
     const label = `${next?.getAttribute("aria-label") ?? ""} ${next?.getAttribute("title") ?? ""}`;
-    if (next && /fit/i.test(label)) {
+    const looksClickable = !!next && (next.matches("button, .clickable-icon") || !!next.querySelector("svg"));
+    const looksLikeFit =
+      /fit/i.test(label) || !!next?.querySelector('[class*="chevron"], .lucide-chevron-down, .lucide-chevron-up');
+    if (next && looksClickable && looksLikeFit) {
       this.hiddenNativeFitEl = next;
       next.style.display = "none";
     }
@@ -787,19 +790,31 @@ export class NativePdfOverlay {
   }
 
   /** Inject "Annotations" into the native sidebar dropdown menu (the one with
-   * Thumbnails / Table of contents) whenever it opens. */
+   * Thumbnails / Table of contents) whenever it opens. Two independent hooks
+   * because the menu's mount point is not contractual: a subtree observer on
+   * the document body, plus a post-click sweep of any open menus. */
   private watchSidebarMenus(): void {
     if (this.menuObserver) return;
     const doc = this.contentRoot?.ownerDocument;
     if (!doc) return;
+    const win = doc.defaultView ?? window;
+    const sweep = () => {
+      for (const menuEl of Array.from(doc.querySelectorAll<HTMLElement>(".menu"))) {
+        this.maybeExtendSidebarMenu(menuEl);
+      }
+    };
     this.menuObserver = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const node of Array.from(m.addedNodes)) {
-          if (node instanceof HTMLElement && node.matches(".menu")) this.maybeExtendSidebarMenu(node);
+          if (!(node instanceof HTMLElement)) continue;
+          const menuEl = node.matches(".menu") ? node : null;
+          if (menuEl) this.maybeExtendSidebarMenu(menuEl);
+          else if (node.matches(".menu-item") || node.querySelector?.(".menu, .menu-item")) sweep();
         }
       }
     });
-    this.menuObserver.observe(doc.body, { childList: true });
+    this.menuObserver.observe(doc.body, { childList: true, subtree: true });
+    this.listen(doc, "click", () => win.setTimeout(sweep, 0), { capture: true });
     this.cleanups.push(() => {
       this.menuObserver?.disconnect();
       this.menuObserver = null;
@@ -811,7 +826,8 @@ export class NativePdfOverlay {
     const items = Array.from(menuEl.querySelectorAll<HTMLElement>(".menu-item"));
     const thumbs = items.find((el) => el.textContent?.includes("Thumbnails"));
     const outline = items.find((el) => el.textContent?.includes("Table of contents"));
-    if (!thumbs || !outline) return; // some other menu
+    if (!thumbs) return; // some other menu
+    const anchor = outline ?? thumbs;
 
     const item = menuEl.ownerDocument.createElement("div");
     item.className = "menu-item tappable lpa-menu-annotations";
@@ -822,7 +838,7 @@ export class NativePdfOverlay {
       // Do not stop propagation: the bubbling click is what closes the menu.
       this.setSidebarAnnotationsActive(true);
     });
-    outline.insertAdjacentElement("afterend", item);
+    anchor.insertAdjacentElement("afterend", item);
   }
 
   private setSidebarAnnotationsActive(on: boolean): void {
