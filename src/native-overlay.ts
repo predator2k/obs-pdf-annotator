@@ -635,7 +635,15 @@ export class NativePdfOverlay {
   ensureToolbarButtons(group: HTMLElement): void {
     if (this.destroyed) return;
     this.ensureFitWidthButton();
-    this.ensureSidebarTab();
+    const sidebarOk = this.ensureSidebarTab();
+    // The list lives in the sidebar-options menu; the standalone button exists
+    // only as a fallback while the native sidebar internals are unavailable
+    // (they can appear a beat after the toolbar — drop the button then).
+    if (sidebarOk && this.listBtn) {
+      this.listBtn.remove();
+      this.listBtn = null;
+      if (this.listPanelEl) this.closeListPanel();
+    }
     if (this.tagBtn && this.tagBtn.isConnected && this.tagBtn.parentElement === group) {
       this.syncToolbarState();
       return;
@@ -685,20 +693,22 @@ export class NativePdfOverlay {
       this.setTagMode(!this.tagMode);
     };
 
-    this.listBtn = group.createEl("button", {
-      cls: "lpa-native-btn clickable-icon",
-      attr: { type: "button", "aria-label": "Show annotations", title: "Show annotations" },
-    });
-    setIcon(this.listBtn, "list");
-    this.listBtn.onclick = (evt) => {
-      evt.preventDefault();
-      evt.stopPropagation();
-      if (this.ensureSidebarTab()) {
-        this.setSidebarAnnotationsActive(!this.sidebarActive);
-      } else {
-        this.toggleListPanel();
-      }
-    };
+    if (!sidebarOk) {
+      this.listBtn = group.createEl("button", {
+        cls: "lpa-native-btn clickable-icon",
+        attr: { type: "button", "aria-label": "Show annotations", title: "Show annotations" },
+      });
+      setIcon(this.listBtn, "list");
+      this.listBtn.onclick = (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        if (this.ensureSidebarTab()) {
+          this.setSidebarAnnotationsActive(!this.sidebarActive);
+        } else {
+          this.toggleListPanel();
+        }
+      };
+    }
 
     this.countEl = group.createSpan({ cls: "lpa-native-count", text: "0" });
     this.syncToolbarState();
