@@ -1344,6 +1344,9 @@ export class NativePdfOverlay {
     if (!boxes.length) return;
 
     const rawByPage = new Map<number, { box: DOMRect; rects: DOMRect[] }>();
+    let selLeft = Infinity;
+    let selRight = -Infinity;
+    let selBottom = -Infinity;
     for (let ri = 0; ri < sel.rangeCount; ri++) {
       const range = sel.getRangeAt(ri);
       for (const cr of Array.from(range.getClientRects())) {
@@ -1354,6 +1357,9 @@ export class NativePdfOverlay {
           (b) => cx >= b.box.left && cx <= b.box.right && cy >= b.box.top && cy <= b.box.bottom
         );
         if (!hit) continue;
+        selLeft = Math.min(selLeft, cr.left);
+        selRight = Math.max(selRight, cr.right);
+        selBottom = Math.max(selBottom, cr.bottom);
         const entry = rawByPage.get(hit.idx) ?? { box: hit.box, rects: [] };
         entry.rects.push(cr);
         rawByPage.set(hit.idx, entry);
@@ -1395,14 +1401,17 @@ export class NativePdfOverlay {
       /* context is best-effort */
     }
     this.pendingSelection = { text, byPage, context };
+    // Anchor on the SELECTION, not the pointer: centered under its last line.
+    const cx2 = Number.isFinite(selLeft) ? (selLeft + selRight) / 2 : anchorX;
+    const cy2 = Number.isFinite(selBottom) ? selBottom : anchorY;
     if (this.pen?.getArmed()) {
       // A toolbar color is armed: the selection IS the highlight.
       this.currentColor = this.pen.getColor();
       this.currentStyle = this.pen.getStyle();
-      this.commitSelection("highlight", anchorX, anchorY);
+      this.commitSelection("highlight", cx2, cy2);
       return;
     }
-    this.showSelectionPopover(anchorX, anchorY);
+    this.showSelectionPopover(cx2, cy2);
   }
 
   private showSelectionPopover(x: number, y: number): void {
@@ -1471,8 +1480,11 @@ export class NativePdfOverlay {
     const pr = pop.getBoundingClientRect();
     const vw = doc.documentElement.clientWidth;
     const vh = doc.documentElement.clientHeight;
-    const px = clamp(8, x + 8, Math.max(8, vw - pr.width - 8));
-    const py = clamp(8, y + 14, Math.max(8, vh - pr.height - 8));
+    // Centered under the selection; the larger mobile drop keeps clear of the
+    // iOS text-selection callout.
+    const gap = Platform.isMobile ? 56 : 12;
+    const px = clamp(8, x - pr.width / 2, Math.max(8, vw - pr.width - 8));
+    const py = clamp(8, y + gap, Math.max(8, vh - pr.height - 8));
     pop.setCssProps({ left: `${px}px`, top: `${py}px`, visibility: "visible" });
   }
 
