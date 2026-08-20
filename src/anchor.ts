@@ -103,8 +103,13 @@ export async function buildDocIndex(
 
 function itemHRange(b: ItemBox, fromCh: number, toChInclusive: number): [number, number] {
   const len = b.str.length || 1;
-  const f = Math.max(0, Math.min(1, fromCh / len));
-  const t = Math.max(0, Math.min(1, (toChInclusive + 1) / len));
+  // Positions inside a text run are PROPORTIONAL estimates (no per-glyph
+  // metrics), so partial boundaries carry error on long runs. Bias them
+  // outward by half a character: a highlight may overshoot slightly but
+  // never cuts characters the user actually selected.
+  const pad = 0.5;
+  const f = Math.max(0, Math.min(1, (fromCh === 0 ? 0 : fromCh - pad) / len));
+  const t = Math.max(0, Math.min(1, (toChInclusive + 1 + (toChInclusive >= len - 1 ? 0 : pad)) / len));
   return [b.x + f * b.w, b.x + t * b.w];
 }
 

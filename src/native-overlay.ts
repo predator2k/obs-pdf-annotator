@@ -1342,6 +1342,10 @@ export class NativePdfOverlay {
 
   private onMouseUp(evt: MouseEvent): void {
     if (this.destroyed || !this.store || this.tagMode) return;
+    // Mobile capture flows solely through the debounced selectionchange
+    // handler: the popup must wait until the selection stops changing (the
+    // grabbers keep firing changes), never appear mid-adjustment.
+    if (Platform.isMobile) return;
     const target = evt.target as HTMLElement | null;
     if (target?.closest(".lpa-selection-popover, .lpa-mark-popover, .lpa-native-controls, .lpa-native-roll, .lpa-native-margins")) return;
     const sel = this.contentRoot?.ownerDocument.getSelection();
@@ -1554,7 +1558,7 @@ export class NativePdfOverlay {
         const last = rects[rects.length - 1];
         if (!last) return;
         void this.captureSelection(cur, last.right, last.bottom);
-      }, 350);
+      }, 3000);
     }
   }
 
