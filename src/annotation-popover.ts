@@ -23,31 +23,40 @@ import { annotationColor, annotationTypeOf, tagPreview } from "./annotation-form
  * Chromium suppresses the click event after a canceled pointerdown.
  */
 export function bindPopoverAction(btn: HTMLElement, fn: (evt: Event) => void): void {
-  let armed = false;
-  let startedHere = false;
+  // Pointer capture unifies mouse and touch: every pointerup of a press that
+  // STARTED here is delivered here, and activation requires the release to
+  // land within the button's bounds (small pad). Drags that started
+  // elsewhere never reach this handler; slide-off releases don't activate;
+  // wobble-off-and-return does — for fingers exactly like mice.
+  let pressId: number | null = null;
   btn.addEventListener("pointerdown", (evt) => {
-    if ((evt as PointerEvent).button === 0) {
-      armed = true;
-      startedHere = true;
+    const pe = evt as PointerEvent;
+    if (pe.button !== 0) return;
+    pressId = pe.pointerId;
+    try {
+      btn.setPointerCapture(pe.pointerId);
+    } catch {
+      /* capture unsupported: bounds check still applies */
     }
   });
-  btn.addEventListener("pointerleave", (evt) => {
-    armed = false;
-    // Button released elsewhere: this press is over for good.
-    if (!((evt as PointerEvent).buttons & 1)) startedHere = false;
-  });
-  btn.addEventListener("pointerenter", (evt) => {
-    // A held press that wobbled off and returned re-arms; a drag that
-    // STARTED elsewhere (text selection) never does.
-    if (startedHere && (evt as PointerEvent).buttons & 1) armed = true;
+  btn.addEventListener("pointercancel", () => {
+    pressId = null;
   });
   btn.addEventListener("pointerup", (evt) => {
-    // Only a left-button press that STARTED on this element activates —
-    // releasing a selection drag over the popover must not commit.
-    const activate = armed && (evt as PointerEvent).button === 0;
-    armed = false;
-    startedHere = false;
-    if (!activate) return;
+    const pe = evt as PointerEvent;
+    if (pe.pointerId !== pressId || pe.button !== 0) {
+      pressId = null;
+      return;
+    }
+    pressId = null;
+    const r = btn.getBoundingClientRect();
+    const pad = 6;
+    const inside =
+      pe.clientX >= r.left - pad &&
+      pe.clientX <= r.right + pad &&
+      pe.clientY >= r.top - pad &&
+      pe.clientY <= r.bottom + pad;
+    if (!inside) return;
     evt.preventDefault();
     evt.stopPropagation();
     fn(evt);

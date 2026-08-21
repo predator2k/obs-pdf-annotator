@@ -71,8 +71,7 @@ import {
 import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha } from "./color";
-import type { AnnotationHub } from "./annotation-hub";
-import { VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
+import { mayHandleDocumentKeys, type AnnotationHub } from "./annotation-hub";
 import { parseLegacyNote, targetBasename, type LegacyAnnotation } from "./legacy-import";
 import { fallbackAnnotationBinding, PdfBundleManager } from "./bundles";
 import { copyPdfDataForWorker } from "./pdf-data";
@@ -1310,13 +1309,6 @@ export class NativePdfOverlay {
     }
   }
 
-  private mayHandleDocumentKeys(): boolean {
-    const activeLeaf = this.app.workspace.activeLeaf;
-    if (activeLeaf === this.leaf) return true;
-    const panelFocused = activeLeaf?.view?.getViewType?.() === VIEW_TYPE_LPA_PANEL;
-    return !!panelFocused && this.hub?.active?.ownsLeaf(this.leaf) === true;
-  }
-
   private async captureSelection(sel: Selection, anchorX: number, anchorY: number): Promise<void> {
     const text = sel.toString().trim();
     if (!text) return;
@@ -1387,20 +1379,11 @@ export class NativePdfOverlay {
         if (anchoredResults.length) {
           const anchored = new Map<number, PdfRect[]>();
           for (const r of anchoredResults) anchored.set(r.page, r.rects);
-          // Accept only when the anchored result covers the DOM pages (a
-          // small minority of DOM rects may sit on a phantom page — the very
-          // offset this path distrusts can push an edge rect across a page
-          // boundary) AND every shared page lands near the DOM rects in BOTH
-          // axes, so a same-height wrong-column occurrence cannot relocate
-          // the highlight.
-          let totalDomRects = 0;
-          let missingDomRects = 0;
-          for (const [page, domRects] of byPage) {
-            totalDomRects += domRects.length;
-            if (!anchored.has(page)) missingDomRects += domRects.length;
-          }
-          const coversDomPages =
-            totalDomRects > 0 && missingDomRects / totalDomRects <= 0.25;
+          // Every shared page must land near the DOM rects in BOTH axes —
+          // a same-height wrong-column occurrence must not relocate the
+          // highlight. Replacement is then PER PAGE: anchored rects win where
+          // available, DOM rects are kept for pages the anchor missed, so a
+          // legitimate short cross-page tail is never dropped.
           let nearDom = false;
           for (const [page, domRects] of byPage) {
             const anchoredRects = anchored.get(page);
@@ -1420,7 +1403,11 @@ export class NativePdfOverlay {
             }
             nearDom = true;
           }
-          if (coversDomPages && nearDom) finalByPage = anchored;
+          if (nearDom) {
+            finalByPage = new Map(
+              [...byPage].map(([page, domRects]) => [page, anchored.get(page) ?? domRects])
+            );
+          }
         }
       } catch (e) {
         console.warn(`${LOG_TAG} selection re-anchoring failed; keeping DOM rects`, e);
@@ -1638,7 +1625,7 @@ export class NativePdfOverlay {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeId) {
       // Document-level listener: only the focused pane may delete — or the
       // Annotations panel, when THIS view is the panel's active source.
-      if (!this.mayHandleDocumentKeys()) return;
+      if (!mayHandleDocumentKeys(this.app, this.hub, this.leaf)) return;
       const target = evt.target as HTMLElement | null;
       if (
         target &&

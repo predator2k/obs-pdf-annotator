@@ -36,8 +36,18 @@ import { PDF_BUNDLE_LIBRARY, pathsForHash, sha256Hex } from "./bundle-identity";
 
 export { PDF_BUNDLE_LIBRARY, sha256Hex } from "./bundle-identity";
 
-/** First line of every export snapshot; excludes it from recovery scans. */
+/** Stamped into every export snapshot; excludes it from recovery scans. */
 export const EXPORT_MARKER = "<!-- lpa-export: annotation snapshot; not a live sidecar -->";
+
+/** Insert the marker AFTER any YAML frontmatter — Obsidian only recognizes
+ * frontmatter on line 1, so prepending would demote it to body text. */
+export function withExportMarker(content: string): string {
+  const fm = content.match(/^---\n[\s\S]*?\n---\n/);
+  if (fm) {
+    return content.slice(0, fm[0].length) + EXPORT_MARKER + "\n" + content.slice(fm[0].length);
+  }
+  return EXPORT_MARKER + "\n" + content;
+}
 
 export interface PdfBundleManifest {
   version: 1;
@@ -112,6 +122,10 @@ function isManifest(value: unknown): value is PdfBundleManifest {
 export class PdfBundleManager {
   private pendingByHash = new Map<string, Promise<PdfBundleBinding>>();
   private hashMemo = new Map<string, string>();
+  private candidateFpMemo = new Map<
+    string,
+    { size: number; mtime: number; parses: boolean; fingerprint: string | undefined }
+  >();
   private pathToHash = new Map<string, string>();
   private legacyFingerprintIndex: Map<string, string[]> | null = null;
 
@@ -152,7 +166,11 @@ export class PdfBundleManager {
     const { annotationPath, backupPath } = pathModeSidecarPaths(file.path, options);
 
     const fallbacks: string[] = [];
-    if (await adapter.exists(backupPath)) fallbacks.push(backupPath);
+    // Same fingerprint gate as every candidate: a different document now at
+    // this path must never inherit the previous occupant's rolling backup.
+    if (await this.annotationCandidateMatches(backupPath, fingerprint)) {
+      fallbacks.push(backupPath);
+    }
     fallbacks.push(
       ...(await this.legacyAnnotationCandidates(file.path, fingerprint, options, annotationPath))
     );
@@ -177,7 +195,7 @@ export class PdfBundleManager {
         const bundleUsable = await this.annotationCandidateMatches(paths.annotationPath, fingerprint);
         if (!(await adapter.exists(annotationPath))) {
           if (bundleUsable) fallbacks.push(paths.annotationPath);
-          if (await adapter.exists(paths.annotationBackupPath)) {
+          if (await this.annotationCandidateMatches(paths.annotationBackupPath, fingerprint)) {
             fallbacks.push(paths.annotationBackupPath);
           }
         } else if (bundleUsable) {
@@ -382,13 +400,21 @@ export class PdfBundleManager {
     const folder = normalizePath(exportFolder).replace(/^\/+|\/+$/g, "");
     const exportPath = normalizePath(`${folder}/${file.basename}${suffix}.annotations.md`);
     // The marker keeps snapshots out of the fingerprint rescue index.
-    const content = EXPORT_MARKER + "\n" + (await adapter.read(sourcePath));
+    const content = withExportMarker(await adapter.read(sourcePath));
     // Vault APIs so the folder and file are indexed immediately
     // (search/switcher); adapter fallback covers unusual paths, loudly.
-    try {
-      await this.app.vault.createFolder(folder);
-    } catch {
-      /* already exists */
+    const existingFolder = this.app.vault.getAbstractFileByPath(folder);
+    if (existingFolder instanceof TFile) {
+      throw new Error(`Cannot export: ${folder} exists and is a file.`);
+    }
+    if (!existingFolder) {
+      try {
+        await this.app.vault.createFolder(folder);
+      } catch (e) {
+        // Fall back to the audited adapter path, which produces an
+        // actionable error when the hierarchy is broken.
+        await this.ensureFolder(folder);
+      }
     }
     try {
       const existing = this.app.vault.getAbstractFileByPath(exportPath);
@@ -522,12 +548,27 @@ export class PdfBundleManager {
     fingerprint: string | undefined
   ): Promise<boolean> {
     try {
-      if (!(await this.app.vault.adapter.exists(path))) return false;
-      const parsed = parseAnnotations(await this.app.vault.adapter.read(path));
-      if (!parsed) return false;
+      const stat = await this.app.vault.adapter.stat(path);
+      if (stat?.type !== "file") return false;
+      // This gate runs on every open; memoize the parse by size+mtime so an
+      // unchanged candidate costs a stat, not a full read.
+      const key = normalizePath(path);
+      const memo = this.candidateFpMemo.get(key);
+      let parses: boolean;
+      let fp: string | undefined;
+      if (memo && memo.size === stat.size && memo.mtime === stat.mtime) {
+        parses = memo.parses;
+        fp = memo.fingerprint;
+      } else {
+        const parsed = parseAnnotations(await this.app.vault.adapter.read(path));
+        parses = !!parsed;
+        fp = parsed?.fingerprint;
+        this.candidateFpMemo.set(key, { size: stat.size, mtime: stat.mtime, parses, fingerprint: fp });
+      }
+      if (!parses) return false;
       // A sidecar with a different document fingerprint must never migrate
       // merely because a new PDF was placed at the same visible path.
-      return !fingerprint || !parsed.fingerprint || parsed.fingerprint === fingerprint;
+      return !fingerprint || !fp || fp === fingerprint;
     } catch {
       return false;
     }
@@ -540,18 +581,12 @@ export class PdfBundleManager {
       if (!file.path.toLowerCase().endsWith(".annotations.md")) continue;
       // Export snapshots share the document fingerprint; counting them would
       // make the uniqueness-gated rescue veto itself (or worse, adopt a stale
-      // snapshot). Both export folder shapes exist: "<folder>/Exports/" and
-      // the flat "PDF exports/" used when the storage folder is hidden.
-      if (
-        file.path.includes("/Exports/") ||
-        file.path === "PDF exports" ||
-        file.path.startsWith("PDF exports/")
-      ) {
-        continue;
-      }
+      // snapshot). Post-marker snapshots are caught by content below; the one
+      // path arm covers pre-marker snapshots at the legacy default location.
+      if (file.path.startsWith(`${LEGACY_DEFAULT_ANNOTATION_FOLDER}/Exports/`)) continue;
       try {
         const content = await this.app.vault.cachedRead(file);
-        if (content.startsWith(EXPORT_MARKER)) continue; // export snapshot
+        if (content.slice(0, 600).includes(EXPORT_MARKER)) continue; // export snapshot
         const parsed = parseAnnotations(content);
         if (!parsed?.fingerprint) continue;
         const paths = index.get(parsed.fingerprint) ?? [];

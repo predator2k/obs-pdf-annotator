@@ -4,8 +4,26 @@
  * AnnotationStore; the hub only tracks which one is "active" and relays
  * change events, so the panel never touches mode internals.
  */
-import { Events, TFile, WorkspaceLeaf } from "obsidian";
+import { App, Events, TFile, WorkspaceLeaf } from "obsidian";
 import type { AnnotationStore } from "./annotations";
+import { VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
+
+/**
+ * May a view react to document-level destructive keys (Backspace/Delete on
+ * the selected annotation)? Only when its pane is focused — or when the
+ * Annotations panel is focused and that view is the panel's active source.
+ * ONE rule for all three viewing modes.
+ */
+export function mayHandleDocumentKeys(
+  app: App,
+  hub: AnnotationHub | undefined,
+  leaf: WorkspaceLeaf
+): boolean {
+  const activeLeaf = app.workspace.activeLeaf;
+  if (activeLeaf === leaf) return true;
+  const panelFocused = activeLeaf?.view?.getViewType?.() === VIEW_TYPE_LPA_PANEL;
+  return !!panelFocused && hub?.active?.ownsLeaf(leaf) === true;
+}
 
 export interface AnnotationSource {
   key: string;
