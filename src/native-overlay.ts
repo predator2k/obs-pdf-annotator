@@ -728,9 +728,7 @@ export class NativePdfOverlay {
       };
     }
 
-    this.countEl = group.createSpan({ cls: "lpa-native-count", text: "0" });
     this.syncToolbarState();
-    this.updateCount();
   }
 
   /** "Fit width" beside the native zoom-in control. */
