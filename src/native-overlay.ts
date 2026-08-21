@@ -372,7 +372,6 @@ export class NativePdfOverlay {
 
   private toolbarSwatchesEl: HTMLElement | null = null;
   private fitWidthBtn: HTMLElement | null = null;
-  private hiddenNativeFitEl: HTMLElement | null = null;
   private sidebarViewEl: HTMLElement | null = null;
   private sidebarActive = false;
   private menuObserver: MutationObserver | null = null;
@@ -755,19 +754,8 @@ export class NativePdfOverlay {
     };
     zoomInEl.insertAdjacentElement("afterend", btn);
     this.fitWidthBtn = btn;
-
-    // The native control right after zoom-in cycles fit-height/fit-width; a
-    // dedicated fit-width button makes it redundant. Recognize it by label or
-    // by its chevron icon, hide it, and restore it on teardown.
-    const next = btn.nextElementSibling as HTMLElement | null;
-    const label = `${next?.getAttribute("aria-label") ?? ""} ${next?.getAttribute("title") ?? ""}`;
-    const looksClickable = !!next && (next.matches("button, .clickable-icon") || !!next.querySelector("svg"));
-    const looksLikeFit =
-      /fit/i.test(label) || !!next?.querySelector('[class*="chevron"], .lucide-chevron-down, .lucide-chevron-up');
-    if (next && looksClickable && looksLikeFit) {
-      this.hiddenNativeFitEl = next;
-      next.style.display = "none";
-    }
+    // NOTE: the native chevron next to this is Obsidian's zoom/layout menu —
+    // it also carries the odd/even spread options, so it stays visible.
   }
 
   /** Annotations as a third native-sidebar choice. Obsidian's sidebar picker
@@ -969,10 +957,6 @@ export class NativePdfOverlay {
     this.countEl = null;
     this.fitWidthBtn?.remove();
     this.fitWidthBtn = null;
-    if (this.hiddenNativeFitEl) {
-      this.hiddenNativeFitEl.style.display = "";
-      this.hiddenNativeFitEl = null;
-    }
     this.sidebarViewEl?.remove();
     this.sidebarViewEl = null;
     this.sidebarActive = false;

@@ -42,6 +42,7 @@ import {
 import { parseColor } from "./color";
 import { AnnotationHub } from "./annotation-hub";
 import { AnnotationPanelView, VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
+import { HtmlAnnotatorView, VIEW_TYPE_HTML_ANNOTATOR } from "./html-view";
 import { PdfBundleManager } from "./bundles";
 
 interface LpaSettings {
@@ -124,6 +125,25 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     );
 
     this.registerView(VIEW_TYPE_LPA_PANEL, (leaf) => new AnnotationPanelView(leaf, this.annotationHub));
+
+    // HTML reader with the same annotation experience. Core Obsidian claims
+    // no view for .html, so the extension registration is uncontested.
+    this.registerView(
+      VIEW_TYPE_HTML_ANNOTATOR,
+      (leaf) =>
+        new HtmlAnnotatorView(
+          leaf,
+          () => this.annotationPathOptions(),
+          this.pen(),
+          this.annotationHub,
+          () => this.settings.mobileSelectionDelayMs
+        )
+    );
+    try {
+      this.registerExtensions(["html", "htm"], VIEW_TYPE_HTML_ANNOTATOR);
+    } catch (e) {
+      console.warn(`${LOG_TAG} could not claim .html (another plugin owns it)`, e);
+    }
 
     this.nativeOverlays = new NativeOverlayManager(
       this,
@@ -258,8 +278,11 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (!(file instanceof TFile) || file.extension !== "pdf") return;
-        void this.onPdfRenamed(file, oldPath);
+        if (!(file instanceof TFile)) return;
+        if (file.extension === "pdf") void this.onPdfRenamed(file, oldPath);
+        else if (file.extension === "html" || file.extension === "htm") {
+          void this.onHtmlRenamed(file, oldPath);
+        }
       })
     );
     this.registerEvent(
@@ -441,6 +464,19 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     }
     this.nativeOverlays.syncPdfPath(file);
     this.scheduleNativePdfRefresh();
+  }
+
+  private async onHtmlRenamed(file: TFile, oldPath: string): Promise<void> {
+    const options = this.annotationPathOptions();
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HTML_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof HtmlAnnotatorView) await view.flushAnnotations(file);
+    }
+    await moveSidecarsForRename(this.app.vault.adapter, oldPath, file.path, options);
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HTML_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof HtmlAnnotatorView) view.syncPath(file);
+    }
   }
 
   /** Re-render annotation UI in every open view after a live setting change. */

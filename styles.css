@@ -2165,3 +2165,74 @@
   min-height: 30px !important;
   max-height: 30px !important;
 }
+
+/* ================= HTML annotator view =================================== */
+.lpa-html-root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.lpa-html-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 24px 16px 64px;
+}
+.lpa-html-body {
+  max-width: 46em;
+  margin: 0 auto;
+  line-height: 1.6;
+  color: var(--text-normal);
+  word-wrap: break-word;
+}
+.lpa-html-body img {
+  max-width: 100%;
+  height: auto;
+}
+.lpa-html-body a {
+  color: var(--link-color, var(--text-accent));
+}
+.lpa-html-body table {
+  max-width: 100%;
+  overflow-x: auto;
+  display: block;
+}
+.lpa-html-body pre {
+  overflow-x: auto;
+  background: var(--code-background, var(--background-secondary));
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+
+/* Inline marks: reflow with the text, styled by the mark's own colors. */
+.lpa-html-mark {
+  cursor: pointer;
+  border-radius: 2px;
+  transition: background-color 140ms ease;
+}
+.lpa-html-mark--highlight {
+  background: color-mix(in srgb, var(--lpa-fill, #ffd400) 42%, transparent);
+}
+.lpa-html-mark--highlight.is-active {
+  background: color-mix(in srgb, var(--lpa-fill, #ffd400) 68%, transparent);
+}
+.lpa-html-mark--underline { border-bottom: 2px solid var(--lpa-ink, currentColor); }
+.lpa-html-mark--dashed { border-bottom: 2px dashed var(--lpa-ink, currentColor); }
+.lpa-html-mark--dotted,
+.lpa-html-mark--comment { border-bottom: 2px dotted var(--lpa-ink, currentColor); }
+.lpa-html-mark--strike { text-decoration: line-through 2px var(--lpa-ink, currentColor); }
+.lpa-html-mark--box {
+  outline: 1.5px solid var(--lpa-ink, currentColor);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+.lpa-html-mark--underline.is-active,
+.lpa-html-mark--dashed.is-active,
+.lpa-html-mark--dotted.is-active,
+.lpa-html-mark--comment.is-active,
+.lpa-html-mark--strike.is-active,
+.lpa-html-mark--box.is-active {
+  background: color-mix(in srgb, var(--lpa-fill, currentColor) 30%, transparent);
+}
+.lpa-html-mark.lpa-flash {
+  animation: lpa-flash 1.1s ease;
+}

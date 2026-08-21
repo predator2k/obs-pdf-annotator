@@ -77,6 +77,16 @@ Add, rename, or remove highlight colors in the plugin settings with a color
 picker. Existing marks always keep the color they were made with, even if you
 later remove it from the palette.
 
+## HTML files too
+
+Open any `.html` or `.htm` file in the vault and it renders as a clean,
+theme-styled reading view with the exact same annotation experience: select
+text, pick a color and style, click marks to write notes, find everything in
+the annotations panel. Marks are anchored by their quoted text (with
+surrounding context), so they survive edits around them and reflow with the
+document. Scripts and active content are stripped before rendering; sidecars
+use the same storage as PDFs.
+
 ## Margin note cards (optional)
 
 If you prefer notes laid out beside the page, enable **Show margin note cards**
