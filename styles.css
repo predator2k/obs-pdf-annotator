@@ -2236,3 +2236,27 @@
 .lpa-html-mark.lpa-flash {
   animation: lpa-flash 1.1s ease;
 }
+
+/* HTML view: selectable text (the workspace default is user-select:none)
+   and the same pen toolbar as the PDF mode. */
+.lpa-html-body,
+.lpa-html-body * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+.lpa-html-body {
+  cursor: text;
+}
+.lpa-html-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.lpa-html-toolbar::-webkit-scrollbar {
+  display: none;
+}

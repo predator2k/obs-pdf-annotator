@@ -44,6 +44,9 @@ interface TextPos {
 
 export class HtmlAnnotatorView extends FileView {
   private rootEl!: HTMLElement;
+  private toolbarEl!: HTMLElement;
+  private toolbarSwatchesEl: HTMLElement | null = null;
+  private toolbarStylesEl: HTMLElement | null = null;
   private scrollEl!: HTMLElement;
   private bodyEl!: HTMLElement;
   private store: AnnotationStore | null = null;
@@ -88,6 +91,8 @@ export class HtmlAnnotatorView extends FileView {
 
   async onOpen(): Promise<void> {
     this.rootEl = this.contentEl.createDiv({ cls: "lpa-html-root" });
+    this.toolbarEl = this.rootEl.createDiv({ cls: "lpa-html-toolbar" });
+    this.buildToolbar();
     this.scrollEl = this.rootEl.createDiv({ cls: "lpa-html-scroll" });
     this.bodyEl = this.scrollEl.createEl("article", { cls: "lpa-html-body" });
 
@@ -160,6 +165,62 @@ export class HtmlAnnotatorView extends FileView {
     const options = this.getAnnotationPathOptions();
     const paths = pathModeSidecarPaths(file.path, options);
     this.store.setSidecarPath(paths.annotationPath, paths.backupPath);
+  }
+
+  /** Same pen bar as the PDF toolbar: colors arm/disarm, styles set the pen. */
+  private buildToolbar(): void {
+    this.toolbarEl.empty();
+    this.toolbarSwatchesEl = this.toolbarEl.createDiv({ cls: "lpa-toolbar-swatches" });
+    for (const p of PALETTE) {
+      const sw = this.toolbarSwatchesEl.createEl("button", {
+        cls: "lpa-swatch lpa-toolbar-swatch",
+        attr: { type: "button", "aria-label": p.name, title: `${p.name} — click to highlight selections instantly` },
+      });
+      sw.setCssProps({ background: p.fill });
+      sw.dataset.color = p.fill;
+      sw.onclick = (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        const armedHere = this.pen?.getArmed() && this.currentColor === p.fill;
+        this.currentColor = p.fill;
+        this.pen?.set(this.currentColor, this.currentStyle);
+        this.pen?.setArmed(!armedHere);
+        this.syncToolbar();
+      };
+    }
+    this.toolbarStylesEl = this.toolbarEl.createDiv({ cls: "lpa-toolbar-styles" });
+    buildSelectionStyleRow(
+      this.toolbarStylesEl,
+      () => this.currentStyle,
+      () => this.currentColor,
+      (st) => {
+        this.currentStyle = st;
+        this.pen?.set(this.currentColor, this.currentStyle);
+        this.syncToolbar();
+      }
+    );
+    this.syncToolbar();
+  }
+
+  private syncToolbar(): void {
+    const armed = !!this.pen?.getArmed();
+    if (this.toolbarSwatchesEl) {
+      for (const sw of Array.from(this.toolbarSwatchesEl.children) as HTMLElement[]) {
+        const isCurrent = sw.dataset.color === this.currentColor;
+        sw.toggleClass("is-active", isCurrent);
+        sw.toggleClass("is-armed", armed && isCurrent);
+        sw.setAttribute("aria-pressed", armed && isCurrent ? "true" : "false");
+      }
+    }
+    if (this.toolbarStylesEl) {
+      for (const b of Array.from(
+        this.toolbarStylesEl.querySelectorAll<HTMLElement>(".lpa-style-btn")
+      )) {
+        b.toggleClass("is-active", b.dataset.style === this.currentStyle);
+        b.style.setProperty("--lpa-ink", markStrokeColor(this.currentColor));
+        b.style.setProperty("--lpa-fill", resolvePalette(this.currentColor)?.fill ?? this.currentColor);
+      }
+    }
   }
 
   private teardown(): void {
@@ -446,6 +507,7 @@ export class HtmlAnnotatorView extends FileView {
     store.add(h);
     this.hideSelectionPopover(true);
     this.paintAll();
+    this.syncToolbar();
   }
 
   private showSelectionPopover(x: number, y: number): void {
