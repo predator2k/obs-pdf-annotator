@@ -68,7 +68,7 @@ import {
   shortAnnotationText,
   tagPreview,
 } from "./annotation-format";
-import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha } from "./color";
 import type { AnnotationHub } from "./annotation-hub";
@@ -155,6 +155,9 @@ export class NativeOverlayManager {
   private overlays = new Map<WorkspaceLeaf, NativePdfOverlay>();
   private attaching = new Set<WorkspaceLeaf>();
   private optedOut = new WeakSet<WorkspaceLeaf>();
+  /** leaf → file path whose attach failed; retried only after the file changes
+   * or an explicit toggle, never in an event-driven loop. */
+  private attachFailedFor = new WeakMap<WorkspaceLeaf, string>();
   private retryTimer: number | null = null;
   private retryCount = 0;
 
@@ -195,7 +198,13 @@ export class NativeOverlayManager {
       if (!nativeViewFile(leaf)) continue;
       // Annotation mode is always on: attach as soon as a PDF opens, unless
       // this leaf was explicitly toggled off.
-      if (!this.overlays.has(leaf) && !this.attaching.has(leaf) && !this.optedOut.has(leaf)) {
+      const file = nativeViewFile(leaf);
+      if (
+        !this.overlays.has(leaf) &&
+        !this.attaching.has(leaf) &&
+        !this.optedOut.has(leaf) &&
+        this.attachFailedFor.get(leaf) !== file?.path
+      ) {
         void this.attach(leaf);
       }
       if (!this.ensureControls(leaf)) missingBar = true;
@@ -252,6 +261,7 @@ export class NativeOverlayManager {
       return;
     }
     this.optedOut.delete(leaf);
+    this.attachFailedFor.delete(leaf);
     await this.attach(leaf);
   }
 
@@ -281,6 +291,7 @@ export class NativeOverlayManager {
       }
       overlay.destroy();
       if (this.overlays.get(leaf) === overlay) this.overlays.delete(leaf);
+      this.attachFailedFor.set(leaf, file.path);
     } finally {
       this.attaching.delete(leaf);
     }
@@ -1390,18 +1401,7 @@ export class NativePdfOverlay {
     if (rotated) this.warnRotatedOnce();
     if (byPage.size === 0) return;
 
-    let context: { prefix?: string; suffix?: string } | undefined;
-    try {
-      const first = sel.getRangeAt(0);
-      const last = sel.getRangeAt(sel.rangeCount - 1);
-      const startText = first.startContainer.textContent ?? "";
-      const endText = last.endContainer.textContent ?? "";
-      const prefix = startText.slice(Math.max(0, first.startOffset - 32), first.startOffset);
-      const suffix = endText.slice(last.endOffset, last.endOffset + 32);
-      if (prefix || suffix) context = { prefix: prefix || undefined, suffix: suffix || undefined };
-    } catch {
-      /* context is best-effort */
-    }
+    const context = selectionContext(sel);
     // Obsidian's MOBILE text layer can sit offset from the painted glyphs
     // (observed on iPad): the DOM selection rects inherit that offset. The
     // plugin's own pdf.js text geometry is glyph-accurate — re-anchor the
@@ -1412,12 +1412,30 @@ export class NativePdfOverlay {
       try {
         const index = await this.getDocIndex();
         if (this.destroyed) return;
+        // The index build can take a while on first use — if the user moved
+        // on to a different (or no) selection meanwhile, commit nothing.
+        const nowSel = this.contentRoot?.ownerDocument.getSelection();
+        if (!nowSel || nowSel.isCollapsed || nowSel.toString().trim() !== text) return;
         const anchoredResults = anchorQuote(index, text, context?.prefix, context?.suffix);
         if (anchoredResults.length) {
           const anchored = new Map<number, PdfRect[]>();
           for (const r of anchoredResults) anchored.set(r.page, r.rects);
-          const overlapsDomPages = [...anchored.keys()].some((page) => byPage.has(page));
-          if (overlapsDomPages) finalByPage = anchored;
+          // Accept only when no DOM page is dropped AND, on a shared page,
+          // the anchored rects land near the DOM rects (a wrong-occurrence
+          // match elsewhere on the page must not relocate the highlight).
+          const coversAllDomPages = [...byPage.keys()].every((page) => anchored.has(page));
+          let nearDom = false;
+          for (const [page, domRects] of byPage) {
+            const anchoredRects = anchored.get(page);
+            if (!anchoredRects?.length || !domRects.length) continue;
+            const geom = this.geoms.get(page);
+            const mid = (rects: PdfRect[]) =>
+              rects.reduce((sum, r) => sum + (r.y1 + r.y2) / 2, 0) / rects.length;
+            const tolerance = (geom?.h ?? 800) * 0.2;
+            if (Math.abs(mid(anchoredRects) - mid(domRects)) <= tolerance) nearDom = true;
+            break;
+          }
+          if (coversAllDomPages && nearDom) finalByPage = anchored;
         }
       } catch (e) {
         console.warn(`${LOG_TAG} selection re-anchoring failed; keeping DOM rects`, e);
@@ -1633,6 +1651,8 @@ export class NativePdfOverlay {
 
   private onKeyDown(evt: KeyboardEvent): void {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeId) {
+      // Document-level listener: only the focused pane may delete.
+      if (this.app.workspace.activeLeaf !== this.leaf) return;
       const target = evt.target as HTMLElement | null;
       if (
         target &&

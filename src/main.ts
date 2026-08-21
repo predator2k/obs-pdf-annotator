@@ -69,6 +69,8 @@ interface LpaSettings {
   mobileSelectionDelayMs: number;
   /** HTML reader zoom, percent. */
   htmlZoomPct: number;
+  /** One-shot marker: the old visible default folder was auto-upgraded. */
+  legacyFolderUpgraded: boolean;
 }
 
 const DEFAULT_SETTINGS: LpaSettings = {
@@ -84,6 +86,7 @@ const DEFAULT_SETTINGS: LpaSettings = {
   penArmed: false,
   mobileSelectionDelayMs: 3000,
   htmlZoomPct: 100,
+  legacyFolderUpgraded: false,
 };
 
 function coerceAnnotationStorageMode(value: string): AnnotationStorageMode {
@@ -253,7 +256,7 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
         if (!(file instanceof TFile) || file.extension !== "pdf") return false;
         if (!checking) {
           void this.bundleManager
-            .exportAnnotations(file, `${this.settings.annotationStorageFolder}/Exports`, this.annotationPathOptions())
+            .exportAnnotations(file, this.exportFolder(), this.annotationPathOptions())
             .then((path) => new Notice(`PDF Annotator: exported ${path}`))
             .catch((e: any) => {
               console.error(`${LOG_TAG} failed to export PDF annotations`, e);
@@ -409,9 +412,16 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.settings.annotationStorageFolder = normalizeAnnotationStorageFolder(
       this.settings.annotationStorageFolder
     );
-    // Auto-upgrade installs that never customized the old visible default.
-    if (this.settings.annotationStorageFolder === LEGACY_DEFAULT_ANNOTATION_FOLDER) {
+    // Auto-upgrade installs that never customized the old visible default —
+    // exactly once, so deliberately choosing "PDF annotations" later sticks.
+    if (
+      !this.settings.legacyFolderUpgraded &&
+      this.settings.annotationStorageFolder === LEGACY_DEFAULT_ANNOTATION_FOLDER
+    ) {
       this.settings.annotationStorageFolder = DEFAULT_ANNOTATION_FOLDER;
+      this.settings.legacyFolderUpgraded = true;
+    } else if (!this.settings.legacyFolderUpgraded) {
+      this.settings.legacyFolderUpgraded = true;
     }
   }
 
@@ -496,6 +506,13 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
       if (view instanceof PdfAnnotatorView) view.refreshAnnotationUi();
     }
     this.nativeOverlays.refreshUi();
+  }
+
+  /** Exports must be user-visible: a hidden annotation folder gets a
+   * dedicated visible export folder instead. */
+  exportFolder(): string {
+    const folder = this.settings.annotationStorageFolder;
+    return folder.startsWith(".") ? "PDF exports" : `${folder}/Exports`;
   }
 
   annotationPathOptions(): AnnotationPathOptions {

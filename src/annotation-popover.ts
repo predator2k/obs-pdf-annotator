@@ -23,10 +23,32 @@ import { annotationColor, annotationTypeOf, tagPreview } from "./annotation-form
  * Chromium suppresses the click event after a canceled pointerdown.
  */
 export function bindPopoverAction(btn: HTMLElement, fn: (evt: Event) => void): void {
+  let pressedHere = false;
+  btn.addEventListener("pointerdown", (evt) => {
+    if ((evt as PointerEvent).button === 0) pressedHere = true;
+  });
+  btn.addEventListener("pointerleave", () => {
+    pressedHere = false;
+  });
   btn.addEventListener("pointerup", (evt) => {
+    // Only a left-button press that STARTED on this element activates —
+    // releasing a selection drag over the popover must not commit.
+    if (!pressedHere || (evt as PointerEvent).button !== 0) {
+      pressedHere = false;
+      return;
+    }
+    pressedHere = false;
     evt.preventDefault();
     evt.stopPropagation();
     fn(evt);
+  });
+  btn.addEventListener("click", (evt) => {
+    // Keyboard activation: Enter/Space synthesize a click with detail 0
+    // (pointer clicks are suppressed by the canceled pointerdown).
+    if ((evt as MouseEvent).detail === 0) {
+      evt.preventDefault();
+      fn(evt);
+    }
   });
 }
 
@@ -67,6 +89,32 @@ export function buildSelectionStyleRow(
     });
   }
   sync();
+}
+
+/**
+ * Nearby text on either side of a selection, for disambiguating repeated
+ * passages when re-anchoring. Boundaries on ELEMENT containers (triple-click,
+ * cross-block drags) have child-index offsets, not text offsets — those sides
+ * yield no context rather than garbage that would poison the sidecar.
+ */
+export function selectionContext(sel: Selection): { prefix?: string; suffix?: string } | undefined {
+  try {
+    const first = sel.getRangeAt(0);
+    const last = sel.getRangeAt(sel.rangeCount - 1);
+    let prefix: string | undefined;
+    let suffix: string | undefined;
+    if (first.startContainer.nodeType === Node.TEXT_NODE) {
+      const t = first.startContainer.textContent ?? "";
+      prefix = t.slice(Math.max(0, first.startOffset - 32), first.startOffset) || undefined;
+    }
+    if (last.endContainer.nodeType === Node.TEXT_NODE) {
+      const t = last.endContainer.textContent ?? "";
+      suffix = t.slice(last.endOffset, last.endOffset + 32) || undefined;
+    }
+    return prefix || suffix ? { prefix, suffix } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface AnnotationEditorHost {

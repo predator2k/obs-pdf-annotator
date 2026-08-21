@@ -45,7 +45,7 @@ import {
   shortAnnotationText,
   tagPreview,
 } from "./annotation-format";
-import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import type { AnnotationHub } from "./annotation-hub";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha, type Rgba } from "./color";
@@ -1461,22 +1461,6 @@ export class PdfAnnotatorView extends FileView {
     return tag;
   }
 
-  /** Nearby text on either side of the selection, for disambiguating repeated
-   * passages when re-anchoring (copy-link / future re-anchor). DOM-local. */
-  private selectionContext(sel: Selection): { prefix?: string; suffix?: string } {
-    try {
-      const range = sel.getRangeAt(0);
-      const endRange = sel.getRangeAt(sel.rangeCount - 1);
-      const startText = range.startContainer.textContent ?? "";
-      const endText = endRange.endContainer.textContent ?? "";
-      const prefix = startText.slice(Math.max(0, range.startOffset - 32), range.startOffset);
-      const suffix = endText.slice(endRange.endOffset, endRange.endOffset + 32);
-      return { prefix: prefix || undefined, suffix: suffix || undefined };
-    } catch {
-      return {};
-    }
-  }
-
   private snapshotSelection(sel: Selection): PendingSelection | null {
     const text = sel.toString().trim();
     if (!text || !this.store) return null;
@@ -1503,7 +1487,7 @@ export class PdfAnnotatorView extends FileView {
 
     const anchor = this.computeSelectionActionAnchor(sel, clientRects);
     if (!anchor) return null;
-    return { text, byPage, anchor, context: this.selectionContext(sel) };
+    return { text, byPage, anchor, context: selectionContext(sel) };
   }
 
   private computeSelectionActionAnchor(sel: Selection, rects: DOMRect[]): SelectionActionAnchor | null {
@@ -2424,6 +2408,8 @@ export class PdfAnnotatorView extends FileView {
 
   private onDocumentKeyDown(evt: KeyboardEvent): void {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeHighlightId) {
+      // Document-level listener: only the focused pane may delete.
+      if (this.app.workspace.activeLeaf !== this.leaf) return;
       const target = evt.target as HTMLElement | null;
       if (
         !target ||

@@ -30,7 +30,7 @@ import {
 } from "./annotations";
 import { contextScore, normChar } from "./anchor";
 import { annotationTypeOf } from "./annotation-format";
-import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import type { AnnotationHub } from "./annotation-hub";
 
 export const VIEW_TYPE_HTML_ANNOTATOR = "lpa-html-annotator";
@@ -272,8 +272,11 @@ export class HtmlAnnotatorView extends FileView {
   private renderHtml(raw: string, file: TFile): void {
     const doc = new DOMParser().parseFromString(raw, "text/html");
     // Strip active content wholesale.
+    // Styles are removed too: the article renders in the LIVE workspace
+    // document, so page CSS would restyle all of Obsidian, and stylesheet
+    // links would fetch remote resources from inside the app.
     doc
-      .querySelectorAll("script, iframe, object, embed, form, base, meta[http-equiv]")
+      .querySelectorAll("script, style, link, iframe, object, embed, form, base, meta[http-equiv]")
       .forEach((el) => el.remove());
     for (const el of Array.from(doc.querySelectorAll<HTMLElement>("*"))) {
       for (const attr of Array.from(el.attributes)) {
@@ -382,9 +385,21 @@ export class HtmlAnnotatorView extends FileView {
     const ordered = [...store.doc.highlights]
       .filter((h) => annotationTypeOf(h) === "highlight" && h.text)
       .sort((a, b) => a.created.localeCompare(b.created));
+    // Resolve EVERY range against the pristine index before any wrapping:
+    // wrapRange splits text nodes, which would stale the index's {node,
+    // offset} pairs. Live Ranges track those later splits, so materializing
+    // them all first keeps every boundary valid.
+    const resolved: Array<{ h: Highlight; range: Range }> = [];
     for (const h of ordered) {
       const range = this.findRange(index, h);
-      if (range) this.wrapRange(range, h);
+      if (range) resolved.push({ h, range });
+    }
+    for (const { h, range } of resolved) {
+      try {
+        this.wrapRange(range, h);
+      } catch (e) {
+        console.warn(`${LOG} failed to paint one annotation`, e);
+      }
     }
   }
 
@@ -475,19 +490,7 @@ export class HtmlAnnotatorView extends FileView {
     if (!this.selectionInsideBody(sel)) return;
     const text = sel.toString().trim();
     if (!text) return;
-    let context: { prefix?: string; suffix?: string } | undefined;
-    try {
-      const first = sel.getRangeAt(0);
-      const last = sel.getRangeAt(sel.rangeCount - 1);
-      const startText = first.startContainer.textContent ?? "";
-      const endText = last.endContainer.textContent ?? "";
-      const prefix = startText.slice(Math.max(0, first.startOffset - 32), first.startOffset);
-      const suffix = endText.slice(last.endOffset, last.endOffset + 32);
-      if (prefix || suffix) context = { prefix: prefix || undefined, suffix: suffix || undefined };
-    } catch {
-      /* best effort */
-    }
-    this.pendingSelection = { text, context };
+    this.pendingSelection = { text, context: selectionContext(sel) };
 
     const rects = sel.rangeCount
       ? Array.from(sel.getRangeAt(sel.rangeCount - 1).getClientRects())
@@ -639,6 +642,8 @@ export class HtmlAnnotatorView extends FileView {
 
   private onKeyDown(evt: KeyboardEvent): void {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeId) {
+      // Document-level listener: only the focused pane may delete.
+      if (this.app.workspace.activeLeaf !== this.leaf) return;
       const target = evt.target as HTMLElement | null;
       if (
         !target ||

@@ -153,6 +153,12 @@ export class PdfBundleManager {
     fallbacks.push(
       ...(await this.legacyAnnotationCandidates(file.path, fingerprint, options, annotationPath))
     );
+    // The pre-upgrade folder's rolling backup is a recovery source too: a
+    // corrupt legacy sidecar must still restore from its own .previous.
+    const legacyBackup = pathModeSidecarPaths(file.path, {
+      storageFolder: LEGACY_DEFAULT_ANNOTATION_FOLDER,
+    }).backupPath;
+    if (await adapter.exists(legacyBackup)) fallbacks.push(legacyBackup);
 
     // Hash-bundle migration + leftover-copy cleanup. Only runs while old
     // bundle data exists; the per-session memo avoids rehashing a file that
@@ -369,7 +375,16 @@ export class PdfBundleManager {
     const folder = normalizePath(exportFolder).replace(/^\/+|\/+$/g, "");
     await this.ensureFolder(folder);
     const exportPath = normalizePath(`${folder}/${file.basename}${suffix}.annotations.md`);
-    await adapter.write(exportPath, await adapter.read(sourcePath));
+    const content = await adapter.read(sourcePath);
+    // Vault APIs so the export is indexed immediately (search/switcher);
+    // adapter fallback covers unusual paths.
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(exportPath);
+      if (existing instanceof TFile) await this.app.vault.modify(existing, content);
+      else await this.app.vault.create(exportPath, content);
+    } catch {
+      await adapter.write(exportPath, content);
+    }
     return exportPath;
   }
 
@@ -509,6 +524,9 @@ export class PdfBundleManager {
     const index = new Map<string, string[]>();
     for (const file of this.app.vault.getMarkdownFiles()) {
       if (!file.path.toLowerCase().endsWith(".annotations.md")) continue;
+      // Export snapshots share the document fingerprint; counting them would
+      // make the uniqueness-gated rescue veto itself.
+      if (file.path.includes("/Exports/")) continue;
       try {
         const parsed = parseAnnotations(await this.app.vault.cachedRead(file));
         if (!parsed?.fingerprint) continue;
