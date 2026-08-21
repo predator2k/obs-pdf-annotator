@@ -537,7 +537,10 @@ export class HtmlAnnotatorView extends FileView {
   }
 
   private showSelectionPopover(x: number, y: number): void {
-    this.hideSelectionPopover(false);
+    // Replace only the ELEMENT — hideSelectionPopover would also null the
+    // pendingSelection this popover is about to commit.
+    this.selectionPopoverEl?.remove();
+    this.selectionPopoverEl = null;
     const doc = this.contentEl.ownerDocument;
     const pop = doc.body.createDiv({ cls: "lpa-selection-popover is-right" });
     this.selectionPopoverEl = pop;
