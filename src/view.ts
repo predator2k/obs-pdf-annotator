@@ -45,7 +45,7 @@ import {
   shortAnnotationText,
   tagPreview,
 } from "./annotation-format";
-import { buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import type { AnnotationHub } from "./annotation-hub";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha, type Rgba } from "./color";
@@ -1567,22 +1567,6 @@ export class PdfAnnotatorView extends FileView {
       evt.stopPropagation();
     };
 
-    // On touch, a tap's click can arrive after the OS clears the selection —
-    // commit on pointerup there (desktop keeps plain clicks).
-    const bindAction = (btn: HTMLElement, fn: (evt: Event) => void) => {
-      if (Platform.isMobile) {
-        btn.addEventListener("pointerup", (evt) => {
-          evt.preventDefault();
-          evt.stopPropagation();
-          fn(evt);
-        });
-      } else {
-        btn.onclick = (evt) => {
-          evt.preventDefault();
-          fn(evt);
-        };
-      }
-    };
 
     // Row 1 — colors. Clicking a color IS the commit: the mark is created
     // immediately with the current style; notes come from clicking the mark.
@@ -1592,7 +1576,7 @@ export class PdfAnnotatorView extends FileView {
       sw.setCssProps({ background: p.fill });
       sw.dataset.color = p.fill;
       sw.toggleClass("is-active", p.fill === this.currentColor);
-      bindAction(sw, () => {
+      bindPopoverAction(sw, () => {
         this.setActiveColor(p.fill);
         this.commitPendingSelection("highlight");
       });

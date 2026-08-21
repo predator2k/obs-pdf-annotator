@@ -2260,3 +2260,36 @@
 .lpa-html-toolbar::-webkit-scrollbar {
   display: none;
 }
+
+/* ---- HTML view follows the PDF container look --------------------------- */
+/* Piggybacks on the user's pdf-dark snippet variables when present
+   (--pdf-nord0 = surround, --pdf-nord1 = page), with theme fallbacks. */
+.lpa-html-scroll {
+  background: var(--pdf-nord0, var(--background-secondary));
+}
+.lpa-html-body {
+  background: var(--pdf-nord1, var(--background-primary));
+  padding: 40px 48px 56px;
+  border-radius: 4px;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.22);
+  zoom: var(--lpa-html-zoom, 1);
+}
+.lpa-html-toolbar-center {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 auto;
+  min-width: 0;
+}
+/* Dark theme: saved pages carry light-theme inline colors (dark gray text)
+   that turn unreadable on a dark page — normalize text to the theme color.
+   Links, code, and our own marks keep their styling. */
+.theme-dark .lpa-html-body
+  :where(p, div, section, article, li, td, th, h1, h2, h3, h4, h5, h6,
+    strong, em, b, i, u, blockquote, figcaption, span:not(.lpa-html-mark)) {
+  color: var(--text-normal) !important;
+  background-color: transparent !important;
+}
+.is-mobile .lpa-html-body {
+  padding: 20px 16px 48px;
+}

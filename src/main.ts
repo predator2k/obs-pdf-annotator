@@ -67,6 +67,8 @@ interface LpaSettings {
   penArmed: boolean;
   /** Mobile: ms the selection must hold still before the popup / armed commit. */
   mobileSelectionDelayMs: number;
+  /** HTML reader zoom, percent. */
+  htmlZoomPct: number;
 }
 
 const DEFAULT_SETTINGS: LpaSettings = {
@@ -81,6 +83,7 @@ const DEFAULT_SETTINGS: LpaSettings = {
   lastMarkStyle: null,
   penArmed: false,
   mobileSelectionDelayMs: 3000,
+  htmlZoomPct: 100,
 };
 
 function coerceAnnotationStorageMode(value: string): AnnotationStorageMode {
@@ -136,7 +139,12 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
           () => this.annotationPathOptions(),
           this.pen(),
           this.annotationHub,
-          () => this.settings.mobileSelectionDelayMs
+          () => this.settings.mobileSelectionDelayMs,
+          () => this.settings.htmlZoomPct,
+          (pct: number) => {
+            this.settings.htmlZoomPct = pct;
+            void this.saveSettings();
+          }
         )
     );
     try {
@@ -391,6 +399,8 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
       this.settings.annotationStorageMode
     );
     this.settings.documentIdentity = coerceDocumentIdentity(this.settings.documentIdentity);
+    const zoom = Number(this.settings.htmlZoomPct);
+    this.settings.htmlZoomPct = Number.isFinite(zoom) ? Math.min(300, Math.max(50, Math.round(zoom))) : 100;
     const delay = Number(this.settings.mobileSelectionDelayMs);
     this.settings.mobileSelectionDelayMs = Number.isFinite(delay)
       ? Math.min(10000, Math.max(0, Math.round(delay)))

@@ -13,7 +13,7 @@
  * Rendering is sanitized: scripts, embeds, and event handlers are stripped;
  * relative image sources resolve against the file's vault folder.
  */
-import { FileView, Menu, Notice, Platform, TFile, WorkspaceLeaf } from "obsidian";
+import { FileView, Menu, Notice, Platform, setIcon, TFile, WorkspaceLeaf } from "obsidian";
 import {
   AnnotationStore,
   defaultColor,
@@ -30,7 +30,7 @@ import {
 } from "./annotations";
 import { contextScore, normChar } from "./anchor";
 import { annotationTypeOf } from "./annotation-format";
-import { buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor } from "./annotation-popover";
 import type { AnnotationHub } from "./annotation-hub";
 
 export const VIEW_TYPE_HTML_ANNOTATOR = "lpa-html-annotator";
@@ -65,7 +65,9 @@ export class HtmlAnnotatorView extends FileView {
     private getAnnotationPathOptions: () => AnnotationPathOptions = () => ({}),
     private pen?: PenState,
     private hub?: AnnotationHub,
-    private getMobileSelectionDelay: () => number = () => 3000
+    private getMobileSelectionDelay: () => number = () => 3000,
+    private getZoomPct: () => number = () => 100,
+    private setZoomPct: (pct: number) => void = () => {}
   ) {
     super(leaf);
     this.navigation = true;
@@ -95,6 +97,7 @@ export class HtmlAnnotatorView extends FileView {
     this.buildToolbar();
     this.scrollEl = this.rootEl.createDiv({ cls: "lpa-html-scroll" });
     this.bodyEl = this.scrollEl.createEl("article", { cls: "lpa-html-body" });
+    this.applyZoom();
 
     this.registerDomEvent(this.scrollEl, "pointerup", (evt) => this.onPointerUp(evt));
     this.registerDomEvent(this.scrollEl, "click", (evt) => this.onClick(evt));
@@ -170,7 +173,25 @@ export class HtmlAnnotatorView extends FileView {
   /** Same pen bar as the PDF toolbar: colors arm/disarm, styles set the pen. */
   private buildToolbar(): void {
     this.toolbarEl.empty();
-    this.toolbarSwatchesEl = this.toolbarEl.createDiv({ cls: "lpa-toolbar-swatches" });
+
+    const zoomBtn = (icon: string, label: string, delta: number) => {
+      const btn = this.toolbarEl.createEl("button", {
+        cls: "lpa-native-btn clickable-icon",
+        attr: { type: "button", "aria-label": label, title: label },
+      });
+      setIcon(btn, icon);
+      btn.onclick = (evt) => {
+        evt.preventDefault();
+        const next = Math.min(300, Math.max(50, this.getZoomPct() + delta));
+        this.setZoomPct(next);
+        this.applyZoom();
+      };
+    };
+    zoomBtn("zoom-out", "Zoom out", -10);
+    zoomBtn("zoom-in", "Zoom in", 10);
+
+    const center = this.toolbarEl.createDiv({ cls: "lpa-html-toolbar-center" });
+    this.toolbarSwatchesEl = center.createDiv({ cls: "lpa-toolbar-swatches" });
     for (const p of PALETTE) {
       const sw = this.toolbarSwatchesEl.createEl("button", {
         cls: "lpa-swatch lpa-toolbar-swatch",
@@ -188,7 +209,7 @@ export class HtmlAnnotatorView extends FileView {
         this.syncToolbar();
       };
     }
-    this.toolbarStylesEl = this.toolbarEl.createDiv({ cls: "lpa-toolbar-styles" });
+    this.toolbarStylesEl = center.createDiv({ cls: "lpa-toolbar-styles" });
     buildSelectionStyleRow(
       this.toolbarStylesEl,
       () => this.currentStyle,
@@ -200,6 +221,11 @@ export class HtmlAnnotatorView extends FileView {
       }
     );
     this.syncToolbar();
+    this.applyZoom();
+  }
+
+  private applyZoom(): void {
+    this.scrollEl?.style.setProperty("--lpa-html-zoom", String(this.getZoomPct() / 100));
   }
 
   private syncToolbar(): void {
@@ -524,27 +550,13 @@ export class HtmlAnnotatorView extends FileView {
       evt.preventDefault();
       evt.stopPropagation();
     };
-    const bindAction = (btn: HTMLElement, fn: (evt: Event) => void) => {
-      if (Platform.isMobile) {
-        btn.addEventListener("pointerup", (evt) => {
-          evt.preventDefault();
-          evt.stopPropagation();
-          fn(evt);
-        });
-      } else {
-        btn.onclick = (evt) => {
-          evt.preventDefault();
-          fn(evt);
-        };
-      }
-    };
     const swatches = pop.createDiv({ cls: "lpa-selection-swatches", attr: { "aria-label": "Highlight color" } });
     for (const p of PALETTE) {
       const sw = swatches.createEl("button", { cls: "lpa-swatch", attr: { "aria-label": p.name, title: p.name } });
       sw.setCssProps({ background: p.fill });
       sw.dataset.color = p.fill;
       sw.toggleClass("is-active", p.fill === this.currentColor);
-      bindAction(sw, () => {
+      bindPopoverAction(sw, () => {
         this.currentColor = p.fill;
         this.pen?.set(this.currentColor, this.currentStyle);
         this.commitSelection();

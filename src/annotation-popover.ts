@@ -18,6 +18,19 @@ import {
 import { annotationColor, annotationTypeOf, tagPreview } from "./annotation-format";
 
 /**
+ * Activate on POINTERUP, never click: these controls live in popovers whose
+ * pointerdown is prevented (to keep the text selection alive), and newer
+ * Chromium suppresses the click event after a canceled pointerdown.
+ */
+export function bindPopoverAction(btn: HTMLElement, fn: (evt: Event) => void): void {
+  btn.addEventListener("pointerup", (evt) => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    fn(evt);
+  });
+}
+
+/**
  * Compact style row for the pre-commit selection popovers: pick underline /
  * box / strike etc. before creating the mark. The chosen style is the "pen"
  * and persists across sessions via the host callback.
@@ -48,11 +61,10 @@ export function buildSelectionStyleRow(
     const pal = resolvePalette(getColor());
     btn.style.setProperty("--lpa-ink", markStrokeColor(getColor()));
     btn.style.setProperty("--lpa-fill", pal?.fill ?? getColor());
-    btn.onclick = (evt) => {
-      evt.preventDefault();
+    bindPopoverAction(btn, () => {
       onPick(st);
       sync();
-    };
+    });
   }
   sync();
 }
