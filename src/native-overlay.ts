@@ -72,6 +72,7 @@ import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, select
 import { copyHighlightLink } from "./copy-link";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha } from "./color";
 import type { AnnotationHub } from "./annotation-hub";
+import { VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
 import { parseLegacyNote, targetBasename, type LegacyAnnotation } from "./legacy-import";
 import { fallbackAnnotationBinding, PdfBundleManager } from "./bundles";
 import { copyPdfDataForWorker } from "./pdf-data";
@@ -284,14 +285,21 @@ export class NativeOverlayManager {
     this.refresh();
     try {
       await overlay.init();
+      this.attachFailedFor.delete(leaf);
     } catch (e) {
       if (!overlay.isDestroyed) {
+        // A real failure: back off (retried on file change or via the
+        // command). A destroyed overlay is OUR teardown (leaf switched
+        // files mid-init) — that must not poison future attaches.
         console.error(`${LOG_TAG} native overlay attach failed`, e);
-        new Notice("PDF Annotator: could not attach the annotation overlay (see console).");
+        new Notice(
+          "PDF Annotator: could not attach the annotation overlay (see console). " +
+            "Run “Toggle annotation mode on the native PDF view” to retry."
+        );
+        this.attachFailedFor.set(leaf, file.path);
       }
       overlay.destroy();
       if (this.overlays.get(leaf) === overlay) this.overlays.delete(leaf);
-      this.attachFailedFor.set(leaf, file.path);
     } finally {
       this.attaching.delete(leaf);
     }
@@ -662,8 +670,9 @@ export class NativePdfOverlay {
   ensureToolbarButtons(group: HTMLElement): void {
     if (this.destroyed) return;
     this.ensureFitWidthButton();
-    const sidebarOk = this.ensureSidebarTab();
-    if (sidebarOk) this.ensureSidebarMenuIntercept();
+    // BOTH pieces must exist before the list button may disappear: the
+    // in-sidebar view AND the menu entry that opens it.
+    const sidebarOk = this.ensureSidebarTab() && this.ensureSidebarMenuIntercept();
     // The list lives in the sidebar-options menu; the standalone button exists
     // only as a fallback while the native sidebar internals are unavailable
     // (they can appear a beat after the toolbar — drop the button then).
@@ -766,10 +775,10 @@ export class NativePdfOverlay {
     // it also carries the odd/even spread options, so it stays visible.
   }
 
-  /** Annotations as a third native-sidebar choice. Obsidian's sidebar picker
-   * is a dropdown menu, so the entry is injected into that menu when it opens
-   * (see watchSidebarMenus); this only prepares the in-sidebar view. Returns
-   * availability; callers fall back to the floating panel without it. */
+  /** Annotations as a third native-sidebar choice: this prepares the
+   * in-sidebar view; ensureSidebarMenuIntercept provides the menu entry.
+   * Returns availability; callers fall back to the floating panel without
+   * it. */
   private ensureSidebarTab(): boolean {
     if (this.destroyed) return false;
     if (this.sidebarViewEl?.isConnected) return true;
@@ -816,9 +825,10 @@ export class NativePdfOverlay {
    * capture-phase listener suppresses the native menu and shows an identical
    * Obsidian menu with Annotations as the third choice.
    */
-  private ensureSidebarMenuIntercept(): void {
+  private ensureSidebarMenuIntercept(): boolean {
     const trigger = this.nativeViewer()?.toolbar?.sidebarOptionsEl as HTMLElement | undefined;
-    if (!trigger?.isConnected || trigger === this.sidebarMenuTriggerEl) return;
+    if (!trigger?.isConnected) return false;
+    if (trigger === this.sidebarMenuTriggerEl) return true;
     this.sidebarMenuTriggerEl = trigger;
     const handler = (evt: Event) => {
       if (this.destroyed) return;
@@ -831,6 +841,7 @@ export class NativePdfOverlay {
       trigger.removeEventListener("click", handler, { capture: true });
       if (this.sidebarMenuTriggerEl === trigger) this.sidebarMenuTriggerEl = null;
     });
+    return true;
   }
 
   private showSidebarMenu(anchor: HTMLElement): void {
@@ -1299,6 +1310,13 @@ export class NativePdfOverlay {
     }
   }
 
+  private mayHandleDocumentKeys(): boolean {
+    const activeLeaf = this.app.workspace.activeLeaf;
+    if (activeLeaf === this.leaf) return true;
+    const panelFocused = activeLeaf?.view?.getViewType?.() === VIEW_TYPE_LPA_PANEL;
+    return !!panelFocused && this.hub?.active?.ownsLeaf(this.leaf) === true;
+  }
+
   private async captureSelection(sel: Selection, anchorX: number, anchorY: number): Promise<void> {
     const text = sel.toString().trim();
     if (!text) return;
@@ -1369,22 +1387,40 @@ export class NativePdfOverlay {
         if (anchoredResults.length) {
           const anchored = new Map<number, PdfRect[]>();
           for (const r of anchoredResults) anchored.set(r.page, r.rects);
-          // Accept only when no DOM page is dropped AND, on a shared page,
-          // the anchored rects land near the DOM rects (a wrong-occurrence
-          // match elsewhere on the page must not relocate the highlight).
-          const coversAllDomPages = [...byPage.keys()].every((page) => anchored.has(page));
+          // Accept only when the anchored result covers the DOM pages (a
+          // small minority of DOM rects may sit on a phantom page — the very
+          // offset this path distrusts can push an edge rect across a page
+          // boundary) AND every shared page lands near the DOM rects in BOTH
+          // axes, so a same-height wrong-column occurrence cannot relocate
+          // the highlight.
+          let totalDomRects = 0;
+          let missingDomRects = 0;
+          for (const [page, domRects] of byPage) {
+            totalDomRects += domRects.length;
+            if (!anchored.has(page)) missingDomRects += domRects.length;
+          }
+          const coversDomPages =
+            totalDomRects > 0 && missingDomRects / totalDomRects <= 0.25;
           let nearDom = false;
           for (const [page, domRects] of byPage) {
             const anchoredRects = anchored.get(page);
             if (!anchoredRects?.length || !domRects.length) continue;
             const geom = this.geoms.get(page);
-            const mid = (rects: PdfRect[]) =>
+            const midY = (rects: PdfRect[]) =>
               rects.reduce((sum, r) => sum + (r.y1 + r.y2) / 2, 0) / rects.length;
-            const tolerance = (geom?.h ?? 800) * 0.2;
-            if (Math.abs(mid(anchoredRects) - mid(domRects)) <= tolerance) nearDom = true;
-            break;
+            const midX = (rects: PdfRect[]) =>
+              rects.reduce((sum, r) => sum + (r.x1 + r.x2) / 2, 0) / rects.length;
+            const nearY =
+              Math.abs(midY(anchoredRects) - midY(domRects)) <= (geom?.h ?? 800) * 0.2;
+            const nearX =
+              Math.abs(midX(anchoredRects) - midX(domRects)) <= (geom?.w ?? 600) * 0.3;
+            if (!nearY || !nearX) {
+              nearDom = false;
+              break;
+            }
+            nearDom = true;
           }
-          if (coversAllDomPages && nearDom) finalByPage = anchored;
+          if (coversDomPages && nearDom) finalByPage = anchored;
         }
       } catch (e) {
         console.warn(`${LOG_TAG} selection re-anchoring failed; keeping DOM rects`, e);
@@ -1600,8 +1636,9 @@ export class NativePdfOverlay {
 
   private onKeyDown(evt: KeyboardEvent): void {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeId) {
-      // Document-level listener: only the focused pane may delete.
-      if (this.app.workspace.activeLeaf !== this.leaf) return;
+      // Document-level listener: only the focused pane may delete — or the
+      // Annotations panel, when THIS view is the panel's active source.
+      if (!this.mayHandleDocumentKeys()) return;
       const target = evt.target as HTMLElement | null;
       if (
         target &&

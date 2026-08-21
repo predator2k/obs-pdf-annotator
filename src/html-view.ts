@@ -32,6 +32,7 @@ import { findBestMatch, normChar, normStr } from "./anchor";
 import { annotationTypeOf } from "./annotation-format";
 import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import type { AnnotationHub } from "./annotation-hub";
+import { VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
 
 export const VIEW_TYPE_HTML_ANNOTATOR = "lpa-html-annotator";
 
@@ -647,10 +648,18 @@ export class HtmlAnnotatorView extends FileView {
     menu.showAtMouseEvent(evt);
   }
 
+  private mayHandleDocumentKeys(): boolean {
+    const activeLeaf = this.app.workspace.activeLeaf;
+    if (activeLeaf === this.leaf) return true;
+    const panelFocused = activeLeaf?.view?.getViewType?.() === VIEW_TYPE_LPA_PANEL;
+    return !!panelFocused && this.hub?.active?.ownsLeaf(this.leaf) === true;
+  }
+
   private onKeyDown(evt: KeyboardEvent): void {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeId) {
-      // Document-level listener: only the focused pane may delete.
-      if (this.app.workspace.activeLeaf !== this.leaf) return;
+      // Document-level listener: only the focused pane may delete — or the
+      // Annotations panel, when THIS view is the panel's active source.
+      if (!this.mayHandleDocumentKeys()) return;
       const target = evt.target as HTMLElement | null;
       if (
         !target ||

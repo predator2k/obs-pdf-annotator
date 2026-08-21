@@ -213,6 +213,43 @@ export function findBestMatch(
 }
 
 /**
+ * Head+tail span fallback for passages with internal extraction drift
+ * (ligatures, hyphenation): match the needle's head and tail and accept a
+ * span of plausible length between them. Shared by quote anchoring and
+ * selection-link building.
+ */
+export function findDriftSpan(
+  search: string,
+  needle: string,
+  nPrefix?: string,
+  nSuffix?: string
+): { start: number; end: number } | null {
+  const hlen = Math.min(40, Math.max(12, Math.floor(needle.length * 0.35)));
+  if (needle.length < hlen) return null;
+  const head = needle.slice(0, hlen);
+  const tail = needle.slice(-hlen);
+  const lo = needle.length * 0.6;
+  const hi = needle.length * 1.6;
+  let fb: { start: number; end: number; score: number } | null = null;
+  let from = 0;
+  for (;;) {
+    const h = search.indexOf(head, from);
+    if (h < 0) break;
+    const t = search.indexOf(tail, h + head.length - 1);
+    if (t >= 0) {
+      const end = t + tail.length - 1;
+      const span = end - h + 1;
+      if (span >= lo && span <= hi) {
+        const score = contextScore(search, h, end, nPrefix, nSuffix);
+        if (!fb || score > fb.score) fb = { start: h, end, score };
+      }
+    }
+    from = h + 1;
+  }
+  return fb ? { start: fb.start, end: fb.end } : null;
+}
+
+/**
  * Locate `exact` in the document, disambiguating duplicates with prefix/suffix.
  * Tries a whole-string match first, then a head+tail span match for passages
  * with minor extraction drift. Returns one result per page covered (a cross-page
@@ -235,27 +272,7 @@ export function anchorQuote(
   if (best) return resultsFromSpan(doc, best.start, best.end);
 
   // --- Pass 2: head + tail span fallback (handles internal drift) ---
-  const hlen = Math.min(40, Math.max(12, Math.floor(needle.length * 0.35)));
-  const head = needle.slice(0, hlen);
-  const tail = needle.slice(-hlen);
-  const lo = needle.length * 0.6;
-  const hi = needle.length * 1.6;
-  let fb: { start: number; end: number; score: number } | null = null;
-  let from = 0;
-  for (;;) {
-    const h = search.indexOf(head, from);
-    if (h < 0) break;
-    const t = search.indexOf(tail, h + head.length - 1);
-    if (t >= 0) {
-      const end = t + tail.length - 1;
-      const span = end - h + 1;
-      if (span >= lo && span <= hi) {
-        const score = contextScore(search, h, end, nPrefix, nSuffix);
-        if (!fb || score > fb.score) fb = { start: h, end, score };
-      }
-    }
-    from = h + 1;
-  }
+  const fb = findDriftSpan(search, needle, nPrefix, nSuffix);
   if (fb) return resultsFromSpan(doc, fb.start, fb.end);
 
   return [];

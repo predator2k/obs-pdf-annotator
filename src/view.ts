@@ -48,6 +48,7 @@ import {
 import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import type { AnnotationHub } from "./annotation-hub";
+import { VIEW_TYPE_LPA_PANEL } from "./annotation-panel";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha, type Rgba } from "./color";
 import { parseLegacyNote, targetBasename, type LegacyAnnotation } from "./legacy-import";
 import { fallbackAnnotationBinding, PdfBundleManager } from "./bundles";
@@ -2408,10 +2409,18 @@ export class PdfAnnotatorView extends FileView {
     this.zoomAt(this.scale * (evt.deltaY < 0 ? 1.1 : 1 / 1.1), evt.clientY);
   }
 
+  private mayHandleDocumentKeys(): boolean {
+    const activeLeaf = this.app.workspace.activeLeaf;
+    if (activeLeaf === this.leaf) return true;
+    const panelFocused = activeLeaf?.view?.getViewType?.() === VIEW_TYPE_LPA_PANEL;
+    return !!panelFocused && this.hub?.active?.ownsLeaf(this.leaf) === true;
+  }
+
   private onDocumentKeyDown(evt: KeyboardEvent): void {
     if ((evt.key === "Backspace" || evt.key === "Delete") && this.activeHighlightId) {
-      // Document-level listener: only the focused pane may delete.
-      if (this.app.workspace.activeLeaf !== this.leaf) return;
+      // Document-level listener: only the focused pane may delete — or the
+      // Annotations panel, when THIS view is the panel's active source.
+      if (!this.mayHandleDocumentKeys()) return;
       const target = evt.target as HTMLElement | null;
       if (
         !target ||

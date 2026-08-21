@@ -23,21 +23,31 @@ import { annotationColor, annotationTypeOf, tagPreview } from "./annotation-form
  * Chromium suppresses the click event after a canceled pointerdown.
  */
 export function bindPopoverAction(btn: HTMLElement, fn: (evt: Event) => void): void {
-  let pressedHere = false;
+  let armed = false;
+  let startedHere = false;
   btn.addEventListener("pointerdown", (evt) => {
-    if ((evt as PointerEvent).button === 0) pressedHere = true;
+    if ((evt as PointerEvent).button === 0) {
+      armed = true;
+      startedHere = true;
+    }
   });
-  btn.addEventListener("pointerleave", () => {
-    pressedHere = false;
+  btn.addEventListener("pointerleave", (evt) => {
+    armed = false;
+    // Button released elsewhere: this press is over for good.
+    if (!((evt as PointerEvent).buttons & 1)) startedHere = false;
+  });
+  btn.addEventListener("pointerenter", (evt) => {
+    // A held press that wobbled off and returned re-arms; a drag that
+    // STARTED elsewhere (text selection) never does.
+    if (startedHere && (evt as PointerEvent).buttons & 1) armed = true;
   });
   btn.addEventListener("pointerup", (evt) => {
     // Only a left-button press that STARTED on this element activates —
     // releasing a selection drag over the popover must not commit.
-    if (!pressedHere || (evt as PointerEvent).button !== 0) {
-      pressedHere = false;
-      return;
-    }
-    pressedHere = false;
+    const activate = armed && (evt as PointerEvent).button === 0;
+    armed = false;
+    startedHere = false;
+    if (!activate) return;
     evt.preventDefault();
     evt.stopPropagation();
     fn(evt);

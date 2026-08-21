@@ -36,6 +36,9 @@ import { PDF_BUNDLE_LIBRARY, pathsForHash, sha256Hex } from "./bundle-identity";
 
 export { PDF_BUNDLE_LIBRARY, sha256Hex } from "./bundle-identity";
 
+/** First line of every export snapshot; excludes it from recovery scans. */
+export const EXPORT_MARKER = "<!-- lpa-export: annotation snapshot; not a live sidecar -->";
+
 export interface PdfBundleManifest {
   version: 1;
   id: string;
@@ -154,11 +157,15 @@ export class PdfBundleManager {
       ...(await this.legacyAnnotationCandidates(file.path, fingerprint, options, annotationPath))
     );
     // The pre-upgrade folder's rolling backup is a recovery source too: a
-    // corrupt legacy sidecar must still restore from its own .previous.
+    // corrupt legacy sidecar must still restore from its own .previous. Same
+    // fingerprint gate as every other candidate — a different document that
+    // now occupies this path must never inherit the old backup.
     const legacyBackup = pathModeSidecarPaths(file.path, {
       storageFolder: LEGACY_DEFAULT_ANNOTATION_FOLDER,
     }).backupPath;
-    if (await adapter.exists(legacyBackup)) fallbacks.push(legacyBackup);
+    if (await this.annotationCandidateMatches(legacyBackup, fingerprint)) {
+      fallbacks.push(legacyBackup);
+    }
 
     // Hash-bundle migration + leftover-copy cleanup. Only runs while old
     // bundle data exists; the per-session memo avoids rehashing a file that
@@ -373,16 +380,23 @@ export class PdfBundleManager {
     if (!sourcePath) throw new Error("No annotations exist for this PDF.");
 
     const folder = normalizePath(exportFolder).replace(/^\/+|\/+$/g, "");
-    await this.ensureFolder(folder);
     const exportPath = normalizePath(`${folder}/${file.basename}${suffix}.annotations.md`);
-    const content = await adapter.read(sourcePath);
-    // Vault APIs so the export is indexed immediately (search/switcher);
-    // adapter fallback covers unusual paths.
+    // The marker keeps snapshots out of the fingerprint rescue index.
+    const content = EXPORT_MARKER + "\n" + (await adapter.read(sourcePath));
+    // Vault APIs so the folder and file are indexed immediately
+    // (search/switcher); adapter fallback covers unusual paths, loudly.
+    try {
+      await this.app.vault.createFolder(folder);
+    } catch {
+      /* already exists */
+    }
     try {
       const existing = this.app.vault.getAbstractFileByPath(exportPath);
       if (existing instanceof TFile) await this.app.vault.modify(existing, content);
       else await this.app.vault.create(exportPath, content);
-    } catch {
+    } catch (e) {
+      console.warn("[local-pdf-annotator] vault export write failed; using adapter", e);
+      await this.ensureFolder(folder);
       await adapter.write(exportPath, content);
     }
     return exportPath;
@@ -525,10 +539,20 @@ export class PdfBundleManager {
     for (const file of this.app.vault.getMarkdownFiles()) {
       if (!file.path.toLowerCase().endsWith(".annotations.md")) continue;
       // Export snapshots share the document fingerprint; counting them would
-      // make the uniqueness-gated rescue veto itself.
-      if (file.path.includes("/Exports/")) continue;
+      // make the uniqueness-gated rescue veto itself (or worse, adopt a stale
+      // snapshot). Both export folder shapes exist: "<folder>/Exports/" and
+      // the flat "PDF exports/" used when the storage folder is hidden.
+      if (
+        file.path.includes("/Exports/") ||
+        file.path === "PDF exports" ||
+        file.path.startsWith("PDF exports/")
+      ) {
+        continue;
+      }
       try {
-        const parsed = parseAnnotations(await this.app.vault.cachedRead(file));
+        const content = await this.app.vault.cachedRead(file);
+        if (content.startsWith(EXPORT_MARKER)) continue; // export snapshot
+        const parsed = parseAnnotations(content);
         if (!parsed?.fingerprint) continue;
         const paths = index.get(parsed.fingerprint) ?? [];
         paths.push(file.path);
