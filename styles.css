@@ -918,10 +918,11 @@
   position: absolute;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  max-width: 100px;
-  min-height: 18px;
-  padding: 2px 6px;
+  gap: 6px;
+  max-width: 160px;
+  min-height: 26px;
+  padding: 4px 10px;
+  font-size: var(--font-ui-small);
   border: 0.5px solid color-mix(in srgb, var(--background-modifier-border) 80%, transparent);
   border-left: 2px solid var(--lpa-accent, var(--interactive-accent));
   border-radius: 4px;
@@ -948,8 +949,8 @@
   border-left-color: var(--interactive-accent);
 }
 .lpa-tag-dot {
-  width: 3px;
-  height: 3px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
   background: var(--lpa-accent, currentColor);
   flex: 0 0 auto;
@@ -1119,11 +1120,10 @@
   position: fixed;
   z-index: 113;
   display: flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 26px;
-  max-height: 30px;
-  padding: 3px 5px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 7px 9px;
   border: 0.5px solid color-mix(in srgb, var(--lpa-accent, var(--interactive-accent)) 26%, var(--background-modifier-border));
   border-radius: 7px;
   background: color-mix(in srgb, var(--background-primary) 94%, transparent);
@@ -1155,13 +1155,11 @@
 .lpa-selection-swatches {
   display: flex;
   align-items: center;
-  gap: 3px;
-  padding-right: 4px;
-  border-right: 0.5px solid color-mix(in srgb, var(--background-modifier-border) 70%, transparent);
+  gap: 6px;
 }
 .lpa-selection-popover .lpa-swatch {
-  width: 13px;
-  height: 13px;
+  width: 24px;
+  height: 24px;
   border-width: 1.5px;
 }
 .lpa-selection-action {
@@ -1667,9 +1665,9 @@
 /* ---- Pre-commit style row in the selection popovers --------------------- */
 .lpa-selection-popover .lpa-selection-styles {
   display: flex;
-  gap: 2px;
+  gap: 3px;
   flex-wrap: wrap;
-  margin: 2px 0;
+  margin: 0;
 }
 
 /* ---- Annotations sidebar panel ------------------------------------------ */
@@ -1754,11 +1752,6 @@
 
 /* ---- Mobile ----------------------------------------------------------- */
 /* Obsidian stamps .is-mobile on the app container. Touch targets ≥ 40px. */
-.is-mobile .lpa-mark-popover .lpa-swatch,
-.is-mobile .lpa-selection-popover .lpa-swatch {
-  width: 28px;
-  height: 28px;
-}
 .is-mobile .lpa-mark-popover .lpa-style-btn,
 .is-mobile .lpa-selection-popover .lpa-style-btn {
   min-width: 40px;
@@ -1790,33 +1783,6 @@
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   margin-bottom: 8px;
-}
-
-/* ---- Selection popover: two rows, color-click commits ------------------- */
-.lpa-selection-popover {
-  flex-direction: column;
-  align-items: stretch;
-  max-height: none;
-  gap: 6px;
-  padding: 7px 9px;
-}
-.lpa-selection-popover .lpa-selection-swatches {
-  border-right: none;
-  padding-right: 0;
-  gap: 6px;
-  justify-content: flex-start;
-}
-.lpa-selection-popover .lpa-swatch {
-  width: 24px;
-  height: 24px;
-}
-.lpa-selection-popover .lpa-selection-styles {
-  margin: 0;
-  gap: 3px;
-}
-.is-mobile .lpa-selection-popover .lpa-swatch {
-  width: 30px;
-  height: 30px;
 }
 
 /* ---- Dark theme: punchier annotation chrome ----------------------------- */
@@ -1928,19 +1894,6 @@
   }
 }
 
-/* ---- Bigger page-note tags ---------------------------------------------- */
-.lpa-page-tag {
-  min-height: 26px;
-  max-width: 160px;
-  padding: 4px 10px;
-  gap: 6px;
-  font-size: var(--font-ui-small);
-}
-.lpa-tag-dot {
-  width: 9px;
-  height: 9px;
-}
-
 /* ---- Toolbar swatches: armed = ringed, unarmed = plain dot -------------- */
 /* The persistent gray ring made chosen/unchosen impossible to tell apart. */
 .lpa-toolbar-swatch,
@@ -1984,15 +1937,6 @@
   display: inline-flex;
 }
 
-/* Injected "Annotations" entry in the native sidebar menu: Obsidian only
-   highlights its own items on hover, so provide the affordance ourselves. */
-.menu .lpa-menu-annotations {
-  cursor: var(--cursor);
-}
-.menu .lpa-menu-annotations:hover {
-  background-color: var(--background-modifier-hover);
-}
-
 /* Selected annotation in the list panels */
 .lpa-native-roll-item.is-active {
   background: color-mix(in srgb, var(--lpa-accent, var(--interactive-accent)) 16%, var(--background-primary));
@@ -2015,23 +1959,6 @@
   max-width: 18px;
   min-height: 18px;
   max-height: 18px;
-}
-.is-mobile .lpa-toolbar-swatch {
-  width: 26px;
-  height: 26px;
-  min-width: 26px;
-  max-width: 26px;
-  min-height: 26px;
-  max-height: 26px;
-}
-.is-mobile .lpa-mark-popover .lpa-swatch,
-.is-mobile .lpa-selection-popover .lpa-swatch {
-  width: 30px;
-  height: 30px;
-  min-width: 30px;
-  max-width: 30px;
-  min-height: 30px;
-  max-height: 30px;
 }
 .is-mobile .lpa-toolbar-styles .lpa-style-btn {
   min-width: 34px;

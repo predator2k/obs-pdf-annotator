@@ -385,7 +385,6 @@ export class NativePdfOverlay {
   private fitWidthBtn: HTMLElement | null = null;
   private sidebarViewEl: HTMLElement | null = null;
   private sidebarActive = false;
-  private menuObserver: MutationObserver | null = null;
   private sidebarMenuTriggerEl: HTMLElement | null = null;
   private suppressSidebarViewEvents = 0;
   private toolbarStylesEl: HTMLElement | null = null;
@@ -796,14 +795,17 @@ export class NativePdfOverlay {
       const onViewChanged = () => {
         // Opening the sidebar ourselves ALSO fires this event (the native
         // viewer restores its remembered view) — only a real user choice of
-        // Thumbnails/Outline may take the panel back.
-        if (this.suppressSidebarViewEvents > 0) return;
+        // Thumbnails/Outline may take the panel back. Consume the suppression
+        // on receipt; the timer merely clears a never-delivered one.
+        if (this.suppressSidebarViewEvents > 0) {
+          this.suppressSidebarViewEvents--;
+          return;
+        }
         if (this.sidebarActive) this.setSidebarAnnotationsActive(false);
       };
       bus.on("sidebarviewchanged", onViewChanged);
       this.cleanups.push(() => bus.off?.("sidebarviewchanged", onViewChanged));
     }
-    this.watchSidebarMenus();
     if (this.sidebarActive) this.setSidebarAnnotationsActive(true);
     return true;
   }
@@ -876,59 +878,6 @@ export class NativePdfOverlay {
     }
     const rect = anchor.getBoundingClientRect();
     menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
-  }
-
-  /** Inject "Annotations" into the native sidebar dropdown menu (the one with
-   * Thumbnails / Table of contents) whenever it opens. Two independent hooks
-   * because the menu's mount point is not contractual: a subtree observer on
-   * the document body, plus a post-click sweep of any open menus. */
-  private watchSidebarMenus(): void {
-    if (this.menuObserver) return;
-    const doc = this.contentRoot?.ownerDocument;
-    if (!doc) return;
-    const win = doc.defaultView ?? window;
-    const sweep = () => {
-      for (const menuEl of Array.from(doc.querySelectorAll<HTMLElement>(".menu"))) {
-        this.maybeExtendSidebarMenu(menuEl);
-      }
-    };
-    this.menuObserver = new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        for (const node of Array.from(m.addedNodes)) {
-          if (!(node instanceof HTMLElement)) continue;
-          const menuEl = node.matches(".menu") ? node : null;
-          if (menuEl) this.maybeExtendSidebarMenu(menuEl);
-          else if (node.matches(".menu-item") || node.querySelector?.(".menu, .menu-item")) sweep();
-        }
-      }
-    });
-    this.menuObserver.observe(doc.body, { childList: true, subtree: true });
-    this.listen(doc, "click", () => win.setTimeout(sweep, 0), { capture: true });
-    this.cleanups.push(() => {
-      this.menuObserver?.disconnect();
-      this.menuObserver = null;
-    });
-  }
-
-  private maybeExtendSidebarMenu(menuEl: HTMLElement): void {
-    if (this.destroyed || menuEl.querySelector(".lpa-menu-annotations")) return;
-    const items = Array.from(menuEl.querySelectorAll<HTMLElement>(".menu-item"));
-    if (items.some((el) => el.textContent?.trim() === "Annotations")) return;
-    const thumbs = items.find((el) => el.textContent?.includes("Thumbnails"));
-    const outline = items.find((el) => el.textContent?.includes("Table of contents"));
-    if (!thumbs) return; // some other menu
-    const anchor = outline ?? thumbs;
-
-    const item = menuEl.ownerDocument.createElement("div");
-    item.className = "menu-item tappable lpa-menu-annotations";
-    const iconEl = item.createDiv({ cls: "menu-item-icon" });
-    if (this.sidebarActive) setIcon(iconEl, "check");
-    item.createDiv({ cls: "menu-item-title", text: "Annotations" });
-    item.addEventListener("click", () => {
-      // Do not stop propagation: the bubbling click is what closes the menu.
-      this.setSidebarAnnotationsActive(true);
-    });
-    anchor.insertAdjacentElement("afterend", item);
   }
 
   private setSidebarAnnotationsActive(on: boolean): void {

@@ -28,7 +28,7 @@ import {
   type MarkStyle,
   type PenState,
 } from "./annotations";
-import { contextScore, normChar } from "./anchor";
+import { findBestMatch, normChar, normStr } from "./anchor";
 import { annotationTypeOf } from "./annotation-format";
 import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import type { AnnotationHub } from "./annotation-hub";
@@ -329,32 +329,19 @@ export class HtmlAnnotatorView extends FileView {
     return { search, map };
   }
 
-  private normQuery(s: string): string {
-    let out = "";
-    for (const c of s) out += normChar(c);
-    return out;
-  }
-
   /** Locate a highlight's quote; returns a DOM Range or null. */
   private findRange(
     index: { search: string; map: TextPos[] },
     h: Highlight
   ): Range | null {
-    const needle = this.normQuery(h.text);
+    const needle = normStr(h.text);
     if (needle.length < 1) return null;
-    const nPrefix = h.context?.prefix ? this.normQuery(h.context.prefix) : undefined;
-    const nSuffix = h.context?.suffix ? this.normQuery(h.context.suffix) : undefined;
-    let best: { start: number; end: number; score: number } | null = null;
-    let from = 0;
-    for (;;) {
-      const at = index.search.indexOf(needle, from);
-      if (at < 0) break;
-      const end = at + needle.length - 1;
-      const score = contextScore(index.search, at, end, nPrefix, nSuffix);
-      if (!best || score > best.score) best = { start: at, end, score };
-      if (best.score >= 4) break;
-      from = at + 1;
-    }
+    const best = findBestMatch(
+      index.search,
+      needle,
+      h.context?.prefix ? normStr(h.context.prefix) : undefined,
+      h.context?.suffix ? normStr(h.context.suffix) : undefined
+    );
     if (!best) return null;
     const first = index.map[best.start];
     const last = index.map[best.end];
@@ -439,6 +426,24 @@ export class HtmlAnnotatorView extends FileView {
     }
   }
 
+  /** Style/color/note edits keep the same text range — update the existing
+   * spans in place instead of re-indexing and re-anchoring the document. */
+  private refreshMarkAppearance(id: string): void {
+    const h = this.store?.get(id);
+    if (!h) return;
+    const st = markStyleOf(h);
+    const pal = resolvePalette(h.color);
+    for (const span of this.marksFor(id)) {
+      span.className = `lpa-html-mark lpa-html-mark--${st}`;
+      span.dataset.hlId = id;
+      span.style.setProperty("--lpa-fill", pal?.fill ?? h.color);
+      span.style.setProperty("--lpa-ink", markStrokeColor(h.color));
+      span.toggleClass("is-active", id === this.activeId);
+      if (h.note) span.setAttribute("title", h.note);
+      else span.removeAttribute("title");
+    }
+  }
+
   private marksFor(id: string): HTMLElement[] {
     return Array.from(
       this.bodyEl.querySelectorAll<HTMLElement>(`span.lpa-html-mark[data-hl-id="${CSS.escape(id)}"]`)
@@ -466,6 +471,8 @@ export class HtmlAnnotatorView extends FileView {
   }
 
   private onSelectionChange(): void {
+    // Idle early-out: nothing to hide and no mobile follow-up needed.
+    if (!Platform.isMobile && !this.selectionPopoverEl) return;
     const sel = this.contentEl.ownerDocument.getSelection();
     const empty = !sel || sel.isCollapsed || sel.toString().trim().length === 0;
     if (this.selectionPopoverEl && empty) this.hideSelectionPopover(false);
@@ -670,8 +677,9 @@ export class HtmlAnnotatorView extends FileView {
         remove: (hid) => {
           store.remove(hid);
           if (this.activeId === hid) this.activeId = null;
+          this.paintAll();
         },
-        repaintPage: () => this.paintAll(),
+        repaintPage: () => this.refreshMarkAppearance(id),
         notifyChanged: () => {
           /* the hub relays store changes to the panel */
         },

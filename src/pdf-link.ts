@@ -14,7 +14,7 @@
  *
  * Pure module — no Obsidian imports — so the smoke tests run headless.
  */
-import { contextScore, normChar, normStr } from "./anchor";
+import { contextScore, findBestMatch, normChar, normStr } from "./anchor";
 
 export interface SelectionSubpath {
   beginIndex: number;
@@ -91,17 +91,7 @@ export function findSelectionInChunks(
   const nSuffix = suffix ? normStr(suffix) : undefined;
 
   // --- Pass 1: whole-string match, best disambiguated occurrence ---
-  let best: { start: number; end: number; score: number } | null = null;
-  let from = 0;
-  for (;;) {
-    const at = search.indexOf(needle, from);
-    if (at < 0) break;
-    const end = at + needle.length - 1;
-    const score = contextScore(search, at, end, nPrefix, nSuffix);
-    if (!best || score > best.score) best = { start: at, end, score };
-    if (best.score >= 4) break;
-    from = at + 1;
-  }
+  const best = findBestMatch(search, needle, nPrefix, nSuffix);
   if (best) return spanToSubpath(chunks, map, best.start, best.end);
 
   // --- Pass 2: head + tail span fallback (handles internal drift) ---
@@ -112,7 +102,7 @@ export function findSelectionInChunks(
   const lo = needle.length * 0.6;
   const hi = needle.length * 1.6;
   let fb: { start: number; end: number; score: number } | null = null;
-  from = 0;
+  let from = 0;
   for (;;) {
     const h = search.indexOf(head, from);
     if (h < 0) break;

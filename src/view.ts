@@ -1383,6 +1383,8 @@ export class PdfAnnotatorView extends FileView {
   }
 
   private onDocumentSelectionChange(): void {
+    // Idle early-out: nothing pending to hide and no mobile follow-up needed.
+    if (!Platform.isMobile && !this.selectionPopoverEl && !this.pendingSelection) return;
     const sel = this.contentEl.ownerDocument.getSelection();
     const empty = !sel || sel.isCollapsed || sel.toString().trim().length === 0;
     if (empty) {
