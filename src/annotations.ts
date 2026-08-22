@@ -329,8 +329,13 @@ function pdfAnnotationStem(pdfVaultPath: string): string {
   return normalizePath(pdfVaultPath).replace(/\.pdf$/i, "");
 }
 
-export function normalizeAnnotationStorageFolder(folder: string | null | undefined): string {
-  const normalized = normalizePath((folder ?? "").trim() || DEFAULT_ANNOTATION_FOLDER)
+export function normalizeAnnotationStorageFolder(folder: unknown): string {
+  // `unknown`, not `string | null`: this reads a field out of data.json, which
+  // can be hand-edited or mangled by a sync conflict. A number or object here
+  // used to throw on .trim() — inside loadSettings, inside onload, leaving the
+  // plugin half-constructed.
+  const raw = typeof folder === "string" ? folder : "";
+  const normalized = normalizePath(raw.trim() || DEFAULT_ANNOTATION_FOLDER)
     .replace(/^\/+/, "")
     .replace(/\/+$/, "");
   return normalized || DEFAULT_ANNOTATION_FOLDER;
@@ -567,13 +572,30 @@ export function serializeAnnotations(doc: AnnotationDoc, pdfBasename: string): s
   return lines.join("\n");
 }
 
-/** Keep only entries that are actually usable annotations. */
+/**
+ * Keep only entries that are actually usable annotations.
+ *
+ * Validate every field the SERIALIZER dereferences, not just `id`. An entry
+ * with an id but no `created` survived an id-only check and then threw inside
+ * serializeAnnotations' sort on every subsequent save — and because the
+ * debounced save discards its rejection, the user annotated for an hour and
+ * lost all of it on close with nothing but a console message.
+ */
+export function isUsableHighlight(h: unknown): h is Highlight {
+  if (!h || typeof h !== "object") return false;
+  const c = h as Partial<Highlight>;
+  return (
+    typeof c.id === "string" &&
+    typeof c.created === "string" &&
+    typeof c.color === "string" &&
+    typeof c.page === "number" &&
+    Number.isFinite(c.page)
+  );
+}
+
 function sanitizeHighlights(highlights: unknown, path: string): Highlight[] {
   if (!Array.isArray(highlights)) return [];
-  const kept = highlights.filter(
-    (h): h is Highlight =>
-      !!h && typeof h === "object" && typeof (h as Highlight).id === "string"
-  );
+  const kept = highlights.filter(isUsableHighlight);
   if (kept.length !== highlights.length) {
     console.warn(
       `[local-pdf-annotator] dropped ${highlights.length - kept.length} malformed annotation(s) from ${path}`
@@ -623,10 +645,16 @@ export class AnnotationStore {
   doc: AnnotationDoc;
   /** Fired on every store mutation (single choke point: markDirty). */
   onChange: (() => void) | null = null;
+  /** Fired once when a save fails, so the UI can tell the user. */
+  onWriteError: ((error: unknown) => void) | null = null;
+  private warnedWriteFailure = false;
   private dirty = false;
   private flushing: Promise<void> | null = null;
   /** Ids this store deleted, so a merge never resurrects them. */
   private removedIds = new Set<string>();
+  /** Every vault path this store has been bound to, so a merge still recognises
+   * its own sidecar in the window after a rename. */
+  private knownPdfPaths = new Set<string>();
   private flushDebounced: () => void;
 
   constructor(
@@ -640,6 +668,7 @@ export class AnnotationStore {
     private sidecarBackupPath?: string
   ) {
     this.doc = { version: 1, pdf: pdfVaultPath, fingerprint, highlights: [] };
+    this.knownPdfPaths.add(pdfVaultPath);
     this.flushDebounced = debounce(() => void this.flush(), 600, true);
   }
 
@@ -729,6 +758,7 @@ export class AnnotationStore {
   setPdfPath(pdfVaultPath: string, pdfBasename: string): void {
     if (this.doc.pdf === pdfVaultPath && this.pdfBasename === pdfBasename) return;
     this.doc.pdf = pdfVaultPath;
+    this.knownPdfPaths.add(pdfVaultPath);
     this.pdfBasename = pdfBasename;
     this.markDirty();
   }
@@ -787,6 +817,15 @@ export class AnnotationStore {
       // Keep the in-memory document retryable after transient adapter/iCloud
       // failures instead of falsely treating an unsuccessful write as saved.
       this.dirty = true;
+      // TELL the user. The debounced caller discards this rejection, so without
+      // a notice a read-only or full annotation folder produces a session that
+      // looks perfectly healthy and persists nothing — the loss only becomes
+      // visible after the document is closed. Once per store, so a failing
+      // volume cannot spam.
+      if (!this.warnedWriteFailure) {
+        this.warnedWriteFailure = true;
+        this.onWriteError?.(error);
+      }
       throw error;
     }
   }
@@ -802,15 +841,20 @@ export class AnnotationStore {
    */
   private mergeForeignHighlights(disk: AnnotationDoc): void {
     if (!Array.isArray(disk.highlights)) return;
-    // ONLY merge with the same document. Without this gate, a store repointed
-    // at another document's sidecar — which happens when a rename cannot clear
-    // an occupied destination and the move is skipped — would union the two
-    // documents' annotations into one file and erase the other's identity.
-    // Either identifier agreeing is enough: the fingerprint changes when the
-    // PDF's bytes are edited, and the path changes when it is moved.
-    const sameDoc =
-      (!!disk.fingerprint && disk.fingerprint === this.doc.fingerprint) ||
-      (!!disk.pdf && disk.pdf === this.doc.pdf);
+    // Only merge with the SAME document, judged by two independent signals.
+    //
+    // A fingerprint disagreement is decisive: it means the file on disk was
+    // written for different PDF bytes, which is the cross-document graft this
+    // gate exists to stop. When neither side has one (the HTML reader never
+    // does), fall back to the vault path — but compare against every path this
+    // store has been known by, not just its current one. After a rename our
+    // doc.pdf is the NEW path while the file on disk still records the old one,
+    // and a stricter check refused that legitimate merge and then overwrote the
+    // very annotations it had refused to take.
+    const bothFingerprinted = !!disk.fingerprint && !!this.doc.fingerprint;
+    const sameDoc = bothFingerprinted
+      ? disk.fingerprint === this.doc.fingerprint
+      : !disk.pdf || this.knownPdfPaths.has(disk.pdf);
     if (!sameDoc) {
       console.warn(
         `[local-pdf-annotator] ${this.sidecarPath} belongs to another document ` +
@@ -820,7 +864,7 @@ export class AnnotationStore {
     }
     const mine = new Set(this.doc.highlights.map((h) => h.id));
     const added = disk.highlights.filter(
-      (h) => h && typeof h.id === "string" && !mine.has(h.id) && !this.removedIds.has(h.id)
+      (h) => isUsableHighlight(h) && !mine.has(h.id) && !this.removedIds.has(h.id)
     );
     if (!added.length) return;
     this.doc.highlights.push(...added);

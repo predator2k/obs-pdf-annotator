@@ -44,43 +44,83 @@ export interface DocIndex {
   map: GPos[]; // search index -> (page, item, char-in-item)
 }
 
-/** Per-character normalization. Returns "" to drop the char, or 1+ chars. */
+/**
+ * Per-character normalization. Returns "" to drop the char, or 1+ chars.
+ *
+ * DECOMPOSE (NFKD) first, then apply the drop/fold rules to the RESULT.
+ *
+ * Order matters: the compatibility forms decompose INTO the characters we mean
+ * to drop or fold. U+FF0D (the fullwidth hyphen used in Japanese and Chinese
+ * typesetting) becomes "-", U+207B becomes "−", U+0149 becomes a modifier
+ * apostrophe — so checking the input character alone let all of them through
+ * and "研究－開発" stopped matching "研究-開発".
+ *
+ * Decomposition is also the only direction that works per character: no
+ * per-char rule can COMPOSE "e" + U+0301 into "é", so a quote copied in one
+ * composition form never matched a text layer using the other. Expanding both
+ * sides makes them meet, and it generalizes past Latin (Japanese dakuten,
+ * Hangul jamo). Marks are KEPT — stripping them merges genuinely different
+ * words (Vietnamese tồi/tôi, Russian мой/мои, French cote/côte), which trades a
+ * failed match for a WRONG one.
+ */
+const normCharMemo = new Map<string, string>();
+
 export function normChar(c: string): string {
+  // Prose reuses a few dozen distinct characters, so this memo turns the two
+  // normalize() calls per character into a map hit; indexing a 600-page book
+  // was measured at roughly 3x faster with it.
+  const hit = normCharMemo.get(c);
+  if (hit !== undefined) return hit;
+  const out = computeNormChar(c);
+  // Bound it: pathological input must not grow this without limit.
+  if (normCharMemo.size < 4096) normCharMemo.set(c, out);
+  return out;
+}
+
+function computeNormChar(c: string): string {
   if (/\s/.test(c)) return "";
-  const code = c.charCodeAt(0);
-  if (code === 0x00ad || code === 0x200b || code === 0x200c || code === 0x200d || code === 0xfeff)
-    return "";
-  // Invisible formatting controls: bidi marks/isolates and the word joiner.
-  // A PDF text layer and a copied quote rarely agree on these, and leaving them
-  // in makes every RTL or mixed-direction passage fail to anchor.
-  if (code === 0x2060 || (code >= 0x200e && code <= 0x200f) || (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069))
-    return "";
-  if (c === "‘" || c === "’" || c === "‚" || c === "‛" || c === "ʼ") return "'";
-  if (c === "“" || c === "”" || c === "„" || c === "‟" || c === "«" || c === "»") return '"';
-  // Drop hyphens/dashes: line-break hyphenation differs between pdf.js versions.
-  if (c === "-" || c === "‐" || c === "‑" || c === "–" || c === "—" || c === "‒" || c === "―" || c === "−")
-    return "";
-  // DECOMPOSE (NFKD), never compose, and KEEP the marks.
-  //
-  // Normalization here is necessarily PER CHARACTER — the index maps each
-  // normalized char back to a raw offset — and composition is inherently
-  // multi-character: no per-char rule can join "e" + U+0301 into "é". So a
-  // quote copied in one composition form never matched a text layer using the
-  // other. Decomposition is the direction that DOES work per character:
-  // precomposed "é" expands to "e" + U+0301, already-decomposed input stays as
-  // it is, and the two sides meet. It generalizes beyond Latin — Japanese
-  // dakuten and Hangul jamo decompose the same way — and the K also folds
-  // ligatures ("ﬁ" -> "fi").
-  //
-  // Marks are kept deliberately. Stripping them matches more sloppy text, but
-  // it merges genuinely different words — Vietnamese tồi/tôi, Russian мой/мои,
-  // French cote/côte — trading "fails to anchor" for "anchors on the WRONG
-  // words", which is the worse failure.
-  //
-  // The second NFKD re-decomposes anything lowercasing recomposed, and NFKD
-  // can emit spaces (U+00B4 -> space + combining acute) into a string that is
-  // documented whitespace-free, so strip those from the result.
-  return c.normalize("NFKD").toLowerCase().normalize("NFKD").replace(/\s/g, "");
+  // toLowerCase never composes, so a second NFKD afterwards is a proven no-op
+  // (verified across every Unicode scalar value).
+  const decomposed = c.normalize("NFKD").toLowerCase();
+  let out = "";
+  for (const ch of decomposed) {
+    if (/\s/.test(ch)) continue; // NFKD emits spaces: U+00B4 -> space + acute
+    const code = ch.charCodeAt(0);
+    if (code === 0x00ad || code === 0x200b || code === 0x200c || code === 0x200d || code === 0xfeff)
+      continue;
+    // Invisible formatting controls: bidi marks/isolates and the word joiner.
+    // A PDF text layer and a copied quote rarely agree on these, and leaving
+    // them in makes every RTL or mixed-direction passage fail to anchor.
+    if (
+      code === 0x2060 ||
+      code === 0x061c ||
+      (code >= 0x200e && code <= 0x200f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    ) {
+      continue;
+    }
+    if (ch === "\u2018" || ch === "\u2019" || ch === "\u201a" || ch === "\u201b" || ch === "\u02bc") {
+      out += "'";
+      continue;
+    }
+    if (
+      ch === "\u201c" || ch === "\u201d" || ch === "\u201e" || ch === "\u201f" ||
+      ch === "\u00ab" || ch === "\u00bb"
+    ) {
+      out += '"';
+      continue;
+    }
+    // Drop hyphens/dashes: line-break hyphenation differs between pdf.js versions.
+    if (
+      ch === "-" || ch === "\u2010" || ch === "\u2011" || ch === "\u2012" || ch === "\u2013" ||
+      ch === "\u2014" || ch === "\u2015" || ch === "\u2212"
+    ) {
+      continue;
+    }
+    out += ch;
+  }
+  return out;
 }
 
 export function normStr(s: string): string {
@@ -203,6 +243,9 @@ function resultsFromSpan(doc: DocIndex, gStart: number, gEnd: number): AnchorRes
 /** How much stored context to weigh. Matches what selectionContext captures. */
 const CONTEXT_WINDOW = 32;
 
+/** Score lead the best occurrence needs before a link may commit to it. */
+const AMBIGUITY_MARGIN = 4;
+
 function commonSuffixLen(a: string, b: string): number {
   let n = 0;
   while (n < a.length && n < b.length && a[a.length - 1 - n] === b[b.length - 1 - n]) n++;
@@ -226,18 +269,22 @@ function commonPrefixLen(a: string, b: string): number {
  * read as "ambiguous" or, worse, picked whichever came first.
  */
 export function contextScore(search: string, start: number, end: number, nPrefix?: string, nSuffix?: string): number {
-  let score = 0;
+  let before = 0;
+  let after = 0;
   if (nPrefix) {
     const tail = nPrefix.slice(-CONTEXT_WINDOW);
-    const before = search.slice(Math.max(0, start - tail.length), start);
-    score += commonSuffixLen(tail, before);
+    before = commonSuffixLen(tail, search.slice(Math.max(0, start - tail.length), start));
   }
   if (nSuffix) {
     const head = nSuffix.slice(0, CONTEXT_WINDOW);
-    const after = search.slice(end + 1, end + 1 + head.length);
-    score += commonPrefixLen(head, after);
+    after = commonPrefixLen(head, search.slice(end + 1, end + 1 + head.length));
   }
-  return score;
+  // Agreement on BOTH sides beats a long run on one side. Plain addition let a
+  // candidate matching 32 characters of prefix and nothing after (32) outrank
+  // one corroborated 9 characters in each direction (18) — the second is far
+  // more likely to be the passage the mark was made on. Weight the weaker side
+  // double so two-sided support dominates.
+  return Math.min(before, after) * 2 + Math.max(before, after);
 }
 
 /**
@@ -261,6 +308,7 @@ export function findBestMatch(
   // the "best" match is just the first one found, which callers that build
   // durable links need to know about.
   let ties = 0;
+  let runnerUp = -1;
   let from = 0;
   for (;;) {
     const at = search.indexOf(needle, from);
@@ -269,9 +317,12 @@ export function findBestMatch(
     const score = contextScore(search, at, end, nPrefix, nSuffix);
     if (!best || score > best.score) {
       best = { start: at, end, score };
+      runnerUp = best.score > score ? best.score : runnerUp;
       ties = 1;
     } else if (score === best.score) {
       ties++;
+    } else if (score > runnerUp) {
+      runnerUp = score;
     }
     // NO early exit on a "good enough" score: stopping at the first strong
     // match cannot know whether a later occurrence scores the same, and that
@@ -280,7 +331,23 @@ export function findBestMatch(
     // occurrences with equally matching context.
     from = at + 1;
   }
-  return best ? { start: best.start, end: best.end, ambiguous: ties > 1 } : null;
+  if (!best) return null;
+  // Ambiguous when nothing meaningful separates the winner from the next
+  // candidate. An EXACT tie is not the only unsafe case: a one-character margin
+  // is noise, since extraction routinely drops a glyph from the context.
+  //
+  // The exception is a candidate that matches ALL the context we stored — there
+  // is no stronger evidence available, so a close runner-up does not make it a
+  // coin flip. Without this, an occurrence agreeing on every one of its 8
+  // recorded suffix characters would be discarded because another agreed on 5.
+  const available = (str: string | undefined) => (str ? Math.min(str.length, CONTEXT_WINDOW) : 0);
+  const p = available(nPrefix);
+  const q = available(nSuffix);
+  const maxScore = Math.min(p, q) * 2 + Math.max(p, q);
+  const decisive = maxScore > 0 && best.score === maxScore && ties === 1;
+  const margin = best.score - Math.max(runnerUp, 0);
+  const ambiguous = !decisive && (ties > 1 || (runnerUp >= 0 && margin < AMBIGUITY_MARGIN));
+  return { start: best.start, end: best.end, ambiguous };
 }
 
 /**
@@ -299,30 +366,38 @@ export function findDriftSpan(
   if (needle.length < hlen) return null;
   const head = needle.slice(0, hlen);
   const tail = needle.slice(-hlen);
-  // The span may exceed the quote by a FIXED allowance, not a percentage.
+  // Head and tail must be INDEPENDENT anchors. Below 2*hlen they overlap (at
+  // needle length 12 they are the same 12 characters), so "both ends matched"
+  // means nothing and the span is free to run far past the quote.
+  if (needle.length < hlen * 2) return null;
+
+  // The span may exceed the quote by an allowance that GROWS WITH THE QUOTE but
+  // is capped.
   //
-  // What actually lands between a matched head and tail is page furniture: a
-  // running header and folio sitting in the concatenated document string where
-  // a quote crosses a page boundary — which is the case this module exists to
-  // handle. That interstitial is roughly constant (tens of characters), so a
-  // ratio is the wrong shape: 1.2x is generous for a long quote and far too
-  // tight for a short one, and it rejected ordinary cross-page selections.
-  //
-  // A fixed allowance still refuses the failure this guard is for — a head and
-  // tail matched paragraphs apart, swallowing sentences the user never
-  // selected. Note the drift this fallback was named for is length-neutral
-  // after normalization (ligatures, hyphens, curly quotes all collapse on both
-  // sides), so the allowance is spent entirely on inserted material.
+  // What lands between a matched head and tail is page furniture: a running
+  // header and folio sitting in the concatenated document string where a quote
+  // crosses a page boundary — the case this module exists to handle. A pure
+  // ratio is too tight for short quotes and too loose for long ones; a pure
+  // fixed allowance is the opposite, and let a 24-character quote anchor onto a
+  // 54-character span, citing words the user never selected.
+  const gap = Math.min(64, Math.max(16, Math.round(needle.length * 0.4)));
   const lo = needle.length * 0.8;
-  const hi = needle.length + 48;
+  const hi = needle.length + gap;
+
   let fb: { start: number; end: number; score: number } | null = null;
   let from = 0;
   for (;;) {
     const h = search.indexOf(head, from);
     if (h < 0) break;
-    const t = search.indexOf(tail, h + head.length - 1);
+    // Search for the tail ONLY inside the window the span could legally end in.
+    // Scanning the rest of the document per head occurrence is O(heads x
+    // length): on a 1.7M-character book index a common 12-character head
+    // (which is what a short quote's head is) took seconds of blocked UI, once
+    // per imported annotation and once per mobile selection commit.
+    const windowEnd = Math.min(search.length, h + hi);
+    const t = search.slice(h, windowEnd).indexOf(tail, head.length - 1);
     if (t >= 0) {
-      const end = t + tail.length - 1;
+      const end = h + t + tail.length - 1;
       const span = end - h + 1;
       if (span >= lo && span <= hi) {
         const score = contextScore(search, h, end, nPrefix, nSuffix);

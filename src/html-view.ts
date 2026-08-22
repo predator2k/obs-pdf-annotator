@@ -151,6 +151,13 @@ export class HtmlAnnotatorView extends FileView {
       false,
       paths.backupPath
     );
+    this.store.onWriteError = (e) => {
+      console.error(`${LOG} failed to save annotations`, e);
+      new Notice(
+        "PDF Annotator: annotations could not be saved. Check that the annotation " +
+          "folder is writable — see the console for details."
+      );
+    };
     await this.store.load();
     if (token !== this.loadToken) return;
     this.paintAll();

@@ -309,10 +309,18 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("css-change", () => refreshForTheme()));
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (!(file instanceof TFile)) return;
-        if (file.extension === "pdf") void this.onPdfRenamed(file, oldPath);
-        else if (file.extension === "html" || file.extension === "htm") {
-          void this.onHtmlRenamed(file, oldPath);
+        if (file instanceof TFile) {
+          void this.onAnnotatableRenamed(file, oldPath);
+          return;
+        }
+        // A FOLDER rename fires once for the folder, not per descendant, so
+        // without this every sidecar under it is orphaned: the documents
+        // reopen empty and the first new mark writes a fresh sidecar beside
+        // the abandoned one. HTML documents cannot even self-heal afterwards,
+        // having no fingerprint for the rescue path to match on.
+        for (const child of this.annotatableFilesUnder(file)) {
+          const childOld = `${oldPath}/${child.path.slice(file.path.length + 1)}`;
+          void this.onAnnotatableRenamed(child, childOld);
         }
       })
     );
@@ -340,7 +348,7 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     // Optional-chained: onunload also runs when onload threw partway, and a
     // throw here would abort Obsidian's own teardown before it removes the
     // plugin from its registry, leaving it wedged as loaded-but-unloadable.
-    this.nativeOverlays?.disable();
+    this.nativeOverlays?.shutdown();
     // Obsidian only auto-detaches our leaves when the USER disabled the plugin;
     // on the update/reload path it does not, so release each view's resources
     // explicitly. Without this a plugin update leaves a zombie view holding a
@@ -410,6 +418,9 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
         await new Promise((resolve) => window.setTimeout(resolve, delayMs));
       }
 
+      // The view type is deregistered on unload, so setting a leaf to it after
+      // that leaves the user with a permanently broken pane.
+      if (this.unloaded) return;
       const leaf = this.app.workspace.activeLeaf;
       if (!leaf) continue;
       if (leaf.view.getViewType() === VIEW_TYPE_PDF_ANNOTATOR) return;
@@ -495,12 +506,17 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     if (valid.length !== entries.length) {
       console.warn(`${LOG_TAG} ignored ${entries.length - valid.length} malformed palette entries`);
     }
-    // Only write back when there WAS a stored palette to clean up. Turning a
-    // null (meaning "use the built-ins") into [] would leave the settings
-    // editor — which treats only null as "show the defaults" — with zero rows
-    // on every default install, and "Restore defaults" could not repair it
-    // because it re-enters here immediately after setting null.
-    if (Array.isArray(raw)) this.settings.customPalette = valid;
+    // Write back an ARRAY as its cleaned self, and anything that is not an
+    // array (hand-edited or sync-mangled data.json: a string, an object, a
+    // number) as null — meaning "use the built-ins".
+    //
+    // Both halves matter. Turning null into [] would leave the settings editor
+    // — which treats only null as "show the defaults" — with zero rows on every
+    // default install. Leaving a non-array untouched is worse: the editor's
+    // `?? DEFAULT_PALETTE` does not catch it, and the first .forEach throws
+    // mid-render, truncating the settings pane before "Restore defaults" and
+    // taking away the only way to repair it.
+    this.settings.customPalette = Array.isArray(raw) ? valid : null;
   }
 
   pen(): PenState {
@@ -545,6 +561,25 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     }
     this.nativeOverlays.syncPdfPath(file);
     this.scheduleNativePdfRefresh();
+  }
+
+  /** Every PDF/HTML file inside a renamed folder, at any depth. */
+  private annotatableFilesUnder(folder: { path: string }): TFile[] {
+    const prefix = `${folder.path}/`;
+    return this.app.vault
+      .getFiles()
+      .filter(
+        (f) =>
+          f.path.startsWith(prefix) &&
+          (f.extension === "pdf" || f.extension === "html" || f.extension === "htm")
+      );
+  }
+
+  private async onAnnotatableRenamed(file: TFile, oldPath: string): Promise<void> {
+    if (file.extension === "pdf") await this.onPdfRenamed(file, oldPath);
+    else if (file.extension === "html" || file.extension === "htm") {
+      await this.onHtmlRenamed(file, oldPath);
+    }
   }
 
   private async onHtmlRenamed(file: TFile, oldPath: string): Promise<void> {
@@ -614,13 +649,20 @@ class LpaSettingTab extends PluginSettingTab {
           "Exports are written separately, to a visible PDF exports folder."
       )
       .addText((t) => {
+        // Debounced: this setting decides where EVERY sidecar is read and
+        // written, and it used to be applied on each keystroke. Typing
+        // "Archive/notes" walked the live setting through "A", "Ar", "Arc" …
+        // and any file opened (or renamed by a sync client) during that window
+        // resolved its annotations into a one-letter folder and kept using it
+        // for the rest of the session.
+        const commitFolder = debounce(async (v: string) => {
+          this.plugin.settings.annotationStorageFolder = normalizeAnnotationStorageFolder(v);
+          await this.plugin.saveSettings();
+        }, 800, false);
         t
           .setPlaceholder(DEFAULT_ANNOTATION_FOLDER)
           .setValue(this.plugin.settings.annotationStorageFolder)
-          .onChange(async (v) => {
-            this.plugin.settings.annotationStorageFolder = normalizeAnnotationStorageFolder(v);
-            await this.plugin.saveSettings();
-          });
+          .onChange((v) => commitFolder(v));
       });
 
     new Setting(containerEl)

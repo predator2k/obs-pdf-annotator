@@ -574,6 +574,128 @@ async function testUserJsonFenceBelowBlock(): Promise<void> {
   console.log("user json fence below the managed block: ok");
 }
 
+
+/** A sidecar belonging to a DIFFERENT document must never be merged in. */
+async function testMergeRefusesAnotherDocument(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Library/paper.pdf", OPTIONS);
+  // Doc B's sidecar already occupies the slot, with B's fingerprint.
+  const docB = annotationDoc("Library/paper.pdf", "fp-b", "b01", "doc B note");
+  await vault.adapter.write(paths.annotationPath, serializeAnnotations(docB, "paper"));
+
+  // Doc A was renamed onto that path: same path, DIFFERENT fingerprint.
+  const store = new AnnotationStore(
+    vault.adapter as any,
+    paths.annotationPath,
+    "paper",
+    "Library/paper.pdf",
+    "fp-a",
+    [],
+    false,
+    paths.backupPath
+  );
+  store.add({ id: "a01", page: 0, color: "#ffd400", text: "doc A", created: "t0" } as any);
+  await store.flush();
+
+  assert.ok(
+    !store.doc.highlights.some((h) => h.id === "b01"),
+    "another document's annotations are not merged in on fingerprint mismatch"
+  );
+  console.log("merge refuses another document: ok");
+}
+
+/** After a rename the on-disk sidecar still records the OLD path; that is our
+ * own file and its annotations must survive. */
+async function testMergeStillWorksAfterRename(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Notes/new.html", OPTIONS);
+  // Written by another device under the pre-rename path, no fingerprint (HTML).
+  const disk: AnnotationDoc = {
+    version: 1,
+    pdf: "Notes/old.html",
+    highlights: [
+      { id: "ipad", page: 0, color: "#ffd400", text: "from the iPad", created: "t0" } as any,
+    ],
+  };
+  await vault.adapter.write(paths.annotationPath, serializeAnnotations(disk, "old"));
+
+  const store = new AnnotationStore(
+    vault.adapter as any,
+    paths.annotationPath,
+    "old",
+    "Notes/old.html",
+    undefined,
+    [],
+    false,
+    paths.backupPath
+  );
+  await store.load();
+  store.setPdfPath("Notes/new.html", "new"); // the rename
+  store.add({ id: "local", page: 0, color: "#ffd400", text: "local", created: "t1" } as any);
+  await store.flush();
+
+  const written = await vault.adapter.read(paths.annotationPath);
+  assert.ok(written.includes("ipad"), "the other device's annotation survives the rename");
+  assert.ok(written.includes("local"), "and so does the local one");
+  console.log("merge still works after rename: ok");
+}
+
+/** A malformed entry must never make saving impossible. */
+async function testMalformedHighlightNeverBreaksSaves(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Books/A.pdf", OPTIONS);
+  // `created` is missing — the serializer sorts on it.
+  const doc: any = {
+    version: 1,
+    pdf: "Books/A.pdf",
+    fingerprint: "fp-a",
+    highlights: [{ id: "broken", page: 0, color: "#ffd400", text: "no created" }],
+  };
+  await vault.adapter.write(paths.annotationPath, serializeAnnotations(doc, "A"));
+
+  const store = new AnnotationStore(
+    vault.adapter as any,
+    paths.annotationPath,
+    "A",
+    "Books/A.pdf",
+    "fp-a",
+    [],
+    false,
+    paths.backupPath
+  );
+  await store.load();
+  store.add({ id: "fresh", page: 0, color: "#ffd400", text: "new work", created: "t1" } as any);
+  await store.flush();
+
+  const written = await vault.adapter.read(paths.annotationPath);
+  assert.ok(written.includes("fresh"), "a session's work still reaches disk");
+  console.log("malformed highlight never breaks saves: ok");
+}
+
+/** A user's own empty-highlights fence must not read as an empty document. */
+async function testUserEmptyHighlightsFenceIsIgnored(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Books/A.pdf", OPTIONS);
+  const doc = annotationDoc("Books/A.pdf", "fp-a", "a01", "real annotation");
+  const withUserFence =
+    serializeAnnotations(doc, "A") + '\n\n## Notes\n\n```json\n{ "highlights": [] }\n```\n';
+  await vault.adapter.write(paths.annotationPath, withUserFence);
+
+  const store = new AnnotationStore(
+    vault.adapter as any,
+    paths.annotationPath,
+    "A",
+    "Books/A.pdf",
+    "fp-a",
+    [],
+    false,
+    paths.backupPath
+  );
+  await store.load();
+  assert.equal(store.doc.highlights.length, 1, "the managed block wins over a lookalike fence");
+  console.log("user empty-highlights fence ignored: ok");
+}
+
 async function main(): Promise<void> {
   await testPathMode();
   await testHashMode();
@@ -585,6 +707,10 @@ async function main(): Promise<void> {
   await testEditDuringFlush();
   await testMergeForeignAnnotations();
   await testUserJsonFenceBelowBlock();
+  await testMergeRefusesAnotherDocument();
+  await testMergeStillWorksAfterRename();
+  await testMalformedHighlightNeverBreaksSaves();
+  await testUserEmptyHighlightsFenceIsIgnored();
   console.log("bundle manager smoke test passed");
 }
 

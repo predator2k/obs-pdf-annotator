@@ -77,6 +77,15 @@ import { fallbackAnnotationBinding, PdfBundleManager } from "./bundles";
 import { copyPdfDataForWorker } from "./pdf-data";
 
 /** Toolbar-injection retry budget (x350ms). A backstop, not a deadline. */
+/**
+ * Plugin-owned UI that can sit over the page. A selection anchored inside any
+ * of it is ours, not the document's — including `.lpa-panel`, the workspace
+ * sidebar panel, whose drawer overlays the content area on phones.
+ */
+const OWN_UI_SELECTOR =
+  ".lpa-selection-popover, .lpa-mark-popover, .lpa-native-controls, .lpa-native-roll, " +
+  ".lpa-native-margins, .lpa-sidebar-annotations, .lpa-panel";
+
 const TOOLBAR_RETRY_LIMIT = 24;
 import {
   fitFoldedMarginCardHeights,
@@ -163,6 +172,9 @@ export class NativeOverlayManager {
   private attachFailedFor = new WeakMap<WorkspaceLeaf, string>();
   private retryTimer: number | null = null;
   private retryCount = 0;
+  /** Set by disable(): the plugin is going away, start nothing new. */
+  /** Latched by shutdown() only — the plugin is unloading, start nothing new. */
+  private disabled = false;
 
   constructor(
     private plugin: Plugin,
@@ -180,6 +192,7 @@ export class NativeOverlayManager {
   }
 
   refresh(): void {
+    if (this.disabled) return;
     if (!this.enabled()) {
       this.disable();
       return;
@@ -217,6 +230,16 @@ export class NativeOverlayManager {
   }
 
   /** Tear everything down (setting turned off / plugin unload). */
+  /**
+   * Permanent teardown for plugin unload. Unlike disable(), which the settings
+   * toggle uses and must stay reversible, this latches so an attach still in
+   * flight cannot re-inject listeners, observers and a worker that nothing owns.
+   */
+  shutdown(): void {
+    this.disabled = true;
+    this.disable();
+  }
+
   disable(): void {
     if (this.retryTimer !== null) {
       window.clearTimeout(this.retryTimer);
@@ -291,6 +314,14 @@ export class NativeOverlayManager {
       // command silently did nothing.
       this.refresh();
       await overlay.init();
+      // disable() may have run during init(): tearing the overlay down here is
+      // what stops an in-flight attach from re-injecting listeners, observers
+      // and a pdf.js worker that nothing owns any more.
+      if (this.disabled) {
+        overlay.destroy();
+        if (this.overlays.get(leaf) === overlay) this.overlays.delete(leaf);
+        return;
+      }
       this.attachFailedFor.delete(leaf);
     } catch (e) {
       if (!overlay.isDestroyed) {
@@ -320,12 +351,6 @@ export class NativeOverlayManager {
   private ensureControls(leaf: WorkspaceLeaf): boolean {
     const container = leaf.view.containerEl;
     const toolbar = container.querySelector<HTMLElement>(".pdf-toolbar");
-    // The PDF toolbar renders a beat after file-open. Reporting success from
-    // the view-header fallback immediately made `missingBar` never true, so the
-    // retry never ran and the controls sat in the header until some unrelated
-    // workspace event moved them — a migration that then rebuilt the group.
-    // Wait for the real toolbar while retries remain, and only then fall back.
-    if (!toolbar && this.retryCount < TOOLBAR_RETRY_LIMIT) return false;
     const bar =
       toolbar ??
       container.querySelector<HTMLElement>(".view-header .view-actions, .view-actions");
@@ -354,7 +379,12 @@ export class NativeOverlayManager {
     }
 
     this.overlays.get(leaf)?.ensureToolbarButtons(group);
-    return true;
+    // Controls are placed either way, but a fallback placement still counts as
+    // "no toolbar yet" so the retry keeps polling and migrates them the moment
+    // the real one appears. Making this return true unconditionally silently
+    // disabled the retry; making it return false WITHOUT placing them left the
+    // user with no controls at all for seconds. Do both.
+    return !!toolbar;
   }
 
   private scheduleRetry(needed: boolean): void {
@@ -414,6 +444,9 @@ export class NativePdfOverlay {
   /** Obsidian's sidebar content element, if WE gave it `position: relative`. */
   private sidebarPositionPatched: HTMLElement | null = null;
   private sidebarActive = false;
+  /** The user's CHOICE of the Annotations sidebar view, which has to outlive a
+   * toolbar rebuild — `sidebarActive` only tracks whether the DOM is live. */
+  private sidebarWanted = false;
   private sidebarMenuTriggerEl: HTMLElement | null = null;
   private suppressSidebarViewEvents = 0;
   private toolbarStylesEl: HTMLElement | null = null;
@@ -520,6 +553,13 @@ export class NativePdfOverlay {
       binding.migrateFallback,
       binding.annotationBackupPath
     );
+    this.store.onWriteError = (e) => {
+      console.error(`${LOG_TAG} failed to save annotations`, e);
+      new Notice(
+        "PDF Annotator: annotations could not be saved. Check that the annotation " +
+          "folder is writable — see the console for details."
+      );
+    };
     await this.store.load();
     if (this.destroyed) return;
     this.notifyStoreChanged();
@@ -720,7 +760,9 @@ export class NativePdfOverlay {
     if (sidebarOk && this.listBtn) {
       this.listBtn.remove();
       this.listBtn = null;
-      if (this.listPanelEl) this.closeListPanel();
+      // Leave an OPEN floating panel alone: the sidebar becoming available
+      // mid-session is our business, not a reason to shut something the user
+      // deliberately opened and may be reading.
     }
     if (groupIsCurrent) {
       this.syncToolbarState();
@@ -865,7 +907,10 @@ export class NativePdfOverlay {
       bus.on("sidebarviewchanged", onViewChanged);
       this.sidebarBusOff = () => bus.off?.("sidebarviewchanged", onViewChanged);
     }
-    if (this.sidebarActive) this.setSidebarAnnotationsActive(true);
+    // Re-activate from the remembered CHOICE: removeToolbarButtons() clears
+    // sidebarActive, so keying off it meant a rebuilt toolbar dropped the user
+    // back to thumbnails with the menu entry unchecked.
+    if (this.sidebarWanted) this.setSidebarAnnotationsActive(true);
     return true;
   }
 
@@ -947,6 +992,7 @@ export class NativePdfOverlay {
       return;
     }
     this.sidebarActive = on;
+    this.sidebarWanted = on;
     if (on) {
       const win = this.contentRoot?.ownerDocument.defaultView ?? window;
       this.suppressSidebarViewEvents++;
@@ -1104,7 +1150,12 @@ export class NativePdfOverlay {
     // it, and stopping at the root missed exactly those.
     const ceiling = root.closest(".workspace-leaf") ?? root.ownerDocument.body;
     for (let el: HTMLElement | null = canvas ?? root; el; el = el.parentElement) {
-      if (win.getComputedStyle(el).filter.includes("invert")) {
+      // `invert(0)` / `invert(0%)` are resets, not inversions — a substring
+       // test flips dark-page mode on a normal white page and washes the marks
+       // out. Only a non-zero amount counts.
+      const filter = win.getComputedStyle(el).filter;
+      const match = /invert\(\s*([\d.]+)(%?)\s*\)/.exec(filter);
+      if (match && Number(match[1]) > 0) {
         inverted = true;
         break;
       }
@@ -1608,12 +1659,16 @@ export class NativePdfOverlay {
     // "select all" inside a note field would otherwise be captured and, with a
     // colour armed, committed as a phantom mark carrying the note's own text.
     const active = this.contentRoot?.ownerDocument.activeElement as HTMLElement | null;
-    if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return true;
+    if (
+      active &&
+      (active.tagName === "TEXTAREA" || active.tagName === "INPUT") &&
+      active.closest(OWN_UI_SELECTOR)
+    ) {
+      return true;
+    }
     const node = sel.anchorNode;
     const el = node?.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node?.parentElement;
-    return !!el?.closest(
-      ".lpa-selection-popover, .lpa-mark-popover, .lpa-native-controls, .lpa-native-roll, .lpa-native-margins, .lpa-sidebar-annotations"
-    );
+    return !!el?.closest(OWN_UI_SELECTOR);
   }
 
   private hideSelectionPopover(clearNativeSelection: boolean): void {

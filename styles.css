@@ -372,22 +372,29 @@
   display: none;
 }
 .lpa-roll-head {
-  /* Wrap instead of clipping: the fixed right padding plus a nowrap title, the
-     meta counter, the search box and the close button add up to ~516px, so on a
-     phone or any narrow pane the search field and the close "x" were pushed off
-     the right edge — leaving no way to dismiss the strip. */
-  flex-wrap: wrap;
+  /* The floating .lpa-toolbar is absolutely positioned over this row's right
+     end, so the row reserves space for it. That reserve was 174px against a
+     toolbar that measures ~252px, which put the close button UNDER the toolbar:
+     clicking x hit the zoom label instead. Wrapping was worse — it made the row
+     three lines tall on a phone and clipped every card below it. Reserve the
+     real width and let the row's own items shrink instead. */
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 174px 5px 10px;
+  padding: 7px 264px 5px 10px;
 }
 .lpa-roll-title {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-muted);
   white-space: nowrap;
+  /* Yields first when the row is tight, so the search field and the close
+     button stay reachable in a narrow pane. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .lpa-roll-meta {
   min-width: 54px;
@@ -1916,6 +1923,14 @@
 .pdf-toolbar .lpa-native-controls {
   min-width: 0;
   overflow-x: auto;
+  /* `visible` is illegal next to a non-visible overflow-x (it computes to
+     auto), so the armed swatch's 4px accent ring — the only thing telling
+     armed from unarmed — would be sliced off top and bottom. Pad the row by
+     the ring's radius and pull it back with a negative margin so the ring has
+     somewhere to live inside the scroll box. */
+  overflow-y: auto;
+  padding-block: 5px;
+  margin-block: -5px;
   scrollbar-width: none;
 }
 .pdf-toolbar .lpa-native-controls::-webkit-scrollbar {
@@ -2245,8 +2260,8 @@
    flattening those with !important turns every code block in a saved article
    monochrome with no way for a user snippet to restore it. */
 .theme-dark .lpa-html-body
-  :where(p, div, section, article, li, td, th, dd, dt, h1, h2, h3, h4, h5, h6,
-    strong, em, b, i, u, small, font, span, blockquote, figcaption):not(pre *):not(code *):not(.lpa-html-mark) {
+  :where(p, div, section, article, li, table, tr, td, th, dd, dt, h1, h2, h3, h4, h5, h6,
+    strong, em, b, i, u, small, font, span, blockquote, figcaption):not(pre *):not(code *):not(a *):not(.lpa-html-mark) {
   color: var(--text-normal) !important;
   background-color: transparent !important;
 }

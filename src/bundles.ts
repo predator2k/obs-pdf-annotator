@@ -464,14 +464,19 @@ export class PdfBundleManager {
     if (existingFolder instanceof TFile) {
       throw new Error(`Cannot export: ${folder} exists and is a file.`);
     }
-    if (!existingFolder) {
-      try {
-        await this.app.vault.createFolder(folder);
-      } catch (e) {
-        // Fall back to the audited adapter path, which produces an
-        // actionable error when the hierarchy is broken.
-        await this.ensureFolder(folder);
+    // Create the export file's OWN parent, not just the export root. Because
+    // the path mirrors the PDF's vault path, anything outside the vault root
+    // needs intermediate folders, and neither vault.create nor adapter.write
+    // creates them — every such export failed with ENOENT.
+    const exportParent = exportPath.slice(0, exportPath.lastIndexOf("/"));
+    try {
+      if (!this.app.vault.getAbstractFileByPath(exportParent)) {
+        await this.app.vault.createFolder(exportParent);
       }
+    } catch (e) {
+      // Fall back to the audited adapter path, which produces an
+      // actionable error when the hierarchy is broken.
+      await this.ensureFolder(exportParent);
     }
     try {
       const existing = this.app.vault.getAbstractFileByPath(exportPath);
@@ -479,7 +484,7 @@ export class PdfBundleManager {
       else await this.app.vault.create(exportPath, content);
     } catch (e) {
       console.warn("[local-pdf-annotator] vault export write failed; using adapter", e);
-      await this.ensureFolder(folder);
+      await this.ensureFolder(exportParent);
       await adapter.write(exportPath, content);
     }
     return exportPath;

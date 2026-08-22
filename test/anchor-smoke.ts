@@ -22,9 +22,22 @@ assert.equal(normChar("‪"), "", "LRE dropped");
 assert.equal(normChar("⁦"), "", "LRI dropped");
 assert.equal(normChar("⁠"), "", "word joiner dropped");
 assert.equal(normStr("abc‎def"), "abcdef", "a bidi mark mid-word still anchors");
-assert.ok(
-  findSelectionInChunks(["abc‎def ghi"], "abcdef"),
-  "text containing a bidi mark is locatable"
+assert.deepEqual(
+  findSelectionInChunks(["abc\u200Edef ghi"], "abcdef"),
+  { beginIndex: 0, beginOffset: 0, endIndex: 0, endOffset: 7 },
+  "a bidi mark is skipped and raw offsets still cover it"
+);
+// One raw character can expand to several normalized slots; the map back to raw
+// offsets is where that most easily goes wrong.
+assert.deepEqual(
+  findSelectionInChunks(["\uAC00\uAC01\uAC02"], "\uAC01"),
+  { beginIndex: 0, beginOffset: 1, endIndex: 0, endOffset: 2 },
+  "Hangul: 1 raw char -> 3 index slots, offsets stay raw"
+);
+assert.deepEqual(
+  findSelectionInChunks(["a\uFB01b"], "afi"),
+  { beginIndex: 0, beginOffset: 0, endIndex: 0, endOffset: 2 },
+  "a ligature expands to two slots but occupies one raw unit"
 );
 
 // --- composition forms must match each other -------------------------------
@@ -86,8 +99,36 @@ assert.ok(homograph, "an accented word still links");
 assert.equal(homograph!.beginOffset, 34, "and it points at the accented occurrence");
 
 // Non-Latin composition forms must also meet, since macOS hands over NFD.
-assert.equal(normStr("が"), normStr("が"), "Japanese dakuten: both forms normalize alike");
-assert.equal(normStr("한"), normStr("한"), "Hangul: precomposed and jamo normalize alike");
+// Both sides are written with explicit escapes: a literal decomposed string in
+// this file gets silently re-composed by editors, which turned these into
+// assertions that a value equals itself and passed with normStr stubbed out.
+assert.equal(
+  normStr("\u304B\u3099"),
+  normStr("\u304C"),
+  "Japanese dakuten: decomposed か+゛ matches precomposed が"
+);
+assert.equal(
+  normStr("\u1112\u1161\u11AB"),
+  normStr("\uD55C"),
+  "Hangul: decomposed jamo matches the precomposed syllable"
+);
+// U+1ED3 is o-with-circumflex-and-grave, so the decomposed form is o + U+0302 + U+0300.
+assert.equal(
+  normStr("o\u0302\u0300i"),
+  normStr("\u1ED3i"),
+  "Vietnamese: stacked marks decompose to the same sequence"
+);
+// NFKD emits a SPACE for some compatibility characters (U+00B4 -> space +
+// combining acute); the search string is documented whitespace-free.
+assert.equal(normStr("a\u00B4b"), "a\u0301b", "an acute accent character keeps only its mark");
+
+// Compatibility forms decompose INTO characters the rules drop, so the rules
+// must run after decomposition, not before.
+assert.equal(
+  normStr("\u7814\u7A76\uFF0D\u958B\u767A"),
+  normStr("\u7814\u7A76-\u958B\u767A"),
+  "a fullwidth hyphen is dropped like an ASCII one"
+);
 
 // --- context disambiguates when the tail alone cannot ----------------------
 // Both occurrences share ", section two, " — only the earlier words differ, so
@@ -106,6 +147,17 @@ assert.ok(wanted, "a quote with distinguishing context still links");
 assert.ok(
   wanted!.beginOffset > 60,
   "and it resolves to the SECOND occurrence, the one the context describes"
+);
+
+// A SHORT quote must not anchor onto a span several times its length: the
+// allowance has to scale with the quote, not be a flat constant.
+assert.equal(
+  findSelectionInChunks(
+    ["the rate of surplus value is the ratio of unpaid to paid labour in production today"],
+    "surplus value in production"
+  ),
+  null,
+  "a 27-character quote does not anchor onto a 65-character span"
 );
 
 // --- the drift fallback must not swallow unselected material ---------------

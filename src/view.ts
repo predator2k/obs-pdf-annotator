@@ -86,6 +86,9 @@ interface Size {
   h: number;
 }
 
+/** Cap on consecutive render re-entries for one page. */
+const MAX_RENDER_RETRIES = 3;
+
 interface PageView {
   index: number;
   el: HTMLElement;
@@ -100,6 +103,8 @@ interface PageView {
    * down. The global renderEpoch only changes on zoom/reload; a page can also
    * be discarded on its own by scrolling out of the prefetch band. */
   gen: number;
+  /** Consecutive retry re-entries, so a page cannot render in a tight loop. */
+  retries: number;
   renderTask: any | null;
   textTask: any | null;
 }
@@ -286,6 +291,11 @@ export class PdfAnnotatorView extends FileView {
   async onClose(): Promise<void> {
     this.tagDragDetach?.();
     this.tagDragDetach = null;
+    // This overrides FileView.onClose, which is what would normally trigger
+    // onUnloadFile — the only other place we unregister. Without this the
+    // closed tab's source stays in the hub: the panel keeps listing a dead
+    // document, its entries cannot be deleted, and the view is retained.
+    this.hub?.unregister(this.hubKey);
     await this.flushStore();
     this.teardownDocument();
   }
@@ -625,6 +635,13 @@ export class PdfAnnotatorView extends FileView {
       binding.migrateFallback,
       binding.annotationBackupPath
     );
+    this.store.onWriteError = (e) => {
+      console.error(`${LOG_TAG} failed to save annotations`, e);
+      new Notice(
+        "PDF Annotator: annotations could not be saved. Check that the annotation " +
+          "folder is writable — see the console for details."
+      );
+    };
     await this.store.load();
     if (token !== this.loadToken) return;
 
@@ -709,7 +726,7 @@ export class PdfAnnotatorView extends FileView {
       const noteLayer = el.createDiv({ cls: "lpa-note-layer" });
       const pv: PageView = {
         index: i, el, hlLayer, noteLayer, canvas: null, textLayerEl: null,
-        page: i === 0 ? p1 : null, rendered: false, rendering: false, gen: 0, renderTask: null, textTask: null,
+        page: i === 0 ? p1 : null, rendered: false, rendering: false, gen: 0, retries: 0, renderTask: null, textTask: null,
       };
       this.pageViews.push(pv);
       this.io.observe(el);
@@ -1160,6 +1177,7 @@ export class PdfAnnotatorView extends FileView {
     // and mark the page `rendered` with no canvas and no text layer, so
     // scrolling back showed a blank page with floating highlights.
     const stale = () => epoch !== this.renderEpoch || gen !== pv.gen;
+    let failed = false;
     try {
       const page = pv.page ?? (await this.pdfDoc.getPage(pv.index + 1));
       if (stale()) return;
@@ -1194,6 +1212,9 @@ export class PdfAnnotatorView extends FileView {
       pv.canvas = canvas;
 
       const ctx = canvas.getContext("2d");
+      // Chromium hands back null once its canvas memory budget is spent, and
+      // pdf.js dereferences the context synchronously inside render().
+      if (!ctx) throw new Error(`canvas 2D context unavailable for page ${pv.index + 1}`);
       const renderTask = page.render({
         canvasContext: ctx,
         viewport,
@@ -1228,6 +1249,12 @@ export class PdfAnnotatorView extends FileView {
       // not an error worth a stack trace.
       if (e?.name !== "RenderingCancelledException" && e?.name !== "AbortException") {
         console.error(`${LOG_TAG} failed to render page ${pv.index + 1}`, e);
+        // A genuine failure must NOT be retried. teardownPageContent bumps the
+        // generation, which makes stale() true, so without this the retry below
+        // would re-enter immediately and spin — and for a synchronous throw on
+        // an already-resolved page proxy it recurses with no await between
+        // frames, ending in a stack overflow rather than a slow loop.
+        failed = true;
       }
       this.teardownPageContent(pv);
     } finally {
@@ -1241,8 +1268,21 @@ export class PdfAnnotatorView extends FileView {
       // `visible` holds page INDICES, so after a file switch a stale PageView
       // can still match one the NEW document has on screen; require this exact
       // element to still be in the document before re-rendering it.
-      if (stale() && this.pdfDoc && pv.el.isConnected && this.visible.has(pv.index)) {
+      // Bounded: a page that keeps going stale (a continuous pinch-zoom) is
+      // re-rendered by the next zoom's own pass anyway, so the retry only has
+      // to cover the one render that was refused while `rendering` was true.
+      if (
+        !failed &&
+        stale() &&
+        pv.retries < MAX_RENDER_RETRIES &&
+        this.pdfDoc &&
+        pv.el.isConnected &&
+        this.visible.has(pv.index)
+      ) {
+        pv.retries++;
         void this.renderPageContent(pv);
+      } else if (!stale()) {
+        pv.retries = 0;
       }
     }
   }
