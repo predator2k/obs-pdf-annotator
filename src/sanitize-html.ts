@@ -28,24 +28,56 @@
  * reason. None of them are worth a partial subset in a reading view.
  */
 export const FORBIDDEN_ELEMENTS = new Set([
-  "script", "style", "link", "iframe", "object", "embed", "form", "base", "meta",
-  "noscript", "template", "applet", "frame", "frameset", "portal", "handler", "listener",
+  "script", "style", "link", "iframe", "embed", "base", "meta",
+  "template", "applet", "frame", "frameset", "portal", "handler", "listener",
   "animate", "animatecolor", "animatemotion", "animatetransform", "set", "discard",
   "use", "foreignobject",
 ]);
 
 /** Attributes whose value is fetched or navigated to. Matched by local name, so
  * any prefix bound to xlink (`xlink:href`, `xl:href`) is covered. */
+/**
+ * Unsafe containers whose CHILDREN are legitimate content: drop the element,
+ * keep what it wrapped. Distinct from FORBIDDEN_ELEMENTS, where the subtree is
+ * itself the payload (`<script>`, `<style>`).
+ */
+export const UNWRAP_ELEMENTS = new Set(["form", "object", "noscript"]);
+
 export const URL_ATTRS = new Set([
   "href", "src", "srcset", "poster", "background", "action", "formaction", "data",
   "ping", "cite", "longdesc", "usemap", "profile", "manifest", "codebase", "dynsrc", "lowsrc",
 ]);
 
-/** Inline-style payloads that fetch remote resources, execute, or float an
- * element over Obsidian's own UI (the article renders in the live workspace
- * document, so a fixed-position overlay would cover the real app chrome). */
+/**
+ * Inline-style properties a reading view may keep. An ALLOWLIST, because a
+ * denylist cannot survive indirection: `--p:fixed; position:var(--p)` computes
+ * to `position: fixed` while the declaration serializes as `var(--p)`, and
+ * `background-image:var(--x,\75 rl(...))` fetches a remote beacon while
+ * containing neither "url(" nor a known-bad keyword. Both were verified working
+ * against the previous denylist.
+ *
+ * Custom properties are absent from this list, so `var()` has nothing left to
+ * resolve. So are `position`, `transform` and `z-index` — the article renders
+ * inside the LIVE workspace document, so anything that can leave the flow can
+ * float over Obsidian's own UI as a phishing surface.
+ */
+export const ALLOWED_STYLE_PROPS = new Set([
+  "color", "background-color", "opacity",
+  "font", "font-family", "font-size", "font-style", "font-weight", "font-variant",
+  "line-height", "letter-spacing", "word-spacing", "text-align", "text-indent",
+  "text-transform", "text-shadow", "vertical-align", "white-space", "word-break",
+  "text-decoration", "text-decoration-line", "text-decoration-color", "text-decoration-style",
+  "direction", "unicode-bidi", "list-style-type",
+  "border", "border-top", "border-bottom", "border-left", "border-right",
+  "border-color", "border-style", "border-width", "border-radius",
+  "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
+  "padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
+  "width", "max-width", "height", "max-height",
+]);
+
+/** Fallback text screen, used only when no CSSOM is available to parse with. */
 const FORBIDDEN_STYLE =
-  /url\s*\(|expression\s*\(|-moz-binding|behavior\s*:|@import|position\s*:\s*(?:fixed|sticky)/i;
+  /url\s*\(|image-set\s*\(|expression\s*\(|-moz-binding|behavior\s*:|@import|var\s*\(|position\s*:|transform\s*:|z-index\s*:/i;
 
 /**
  * Is this URL safe to leave in the document? Normalize the way the URL parser
@@ -73,25 +105,37 @@ export function safeUrl(value: string): boolean {
   }
 }
 
-/** Every candidate URL in a srcset must pass, not just the first. */
+/**
+ * Every candidate URL in a srcset must pass, not just the first.
+ *
+ * srcset ends a candidate at a comma AND separates the URL from its descriptor
+ * on whitespace, so neither split alone is right: splitting on commas mangles
+ * data: URLs, and splitting on whitespace alone hands back "1x,javascript:..."
+ * as one token that starts with a digit and therefore matches no scheme —
+ * letting every candidate after the first descriptor through unchecked.
+ *
+ * Split on BOTH, and require any token that carries a scheme to pass. Tokens
+ * without a colon are relative URLs or descriptors ("2x", "640w"), which are
+ * safe by construction; a data: URL's own comma splits it into a head that
+ * still carries — and is judged on — its scheme.
+ */
 export function safeSrcset(value: string): boolean {
-  // The srcset grammar separates a candidate's URL from its descriptor on ASCII
-  // whitespace, and a URL may itself contain commas (data: URLs do), so
-  // splitting on commas both misses candidates and mangles valid ones. Checking
-  // every whitespace-separated token is strictly safer: descriptors like "2x"
-  // or "640w" carry no scheme and pass trivially.
   return value
-    .split(/\s+/)
-    .map((token) => token.replace(/,+$/, ""))
+    .split(/[\s,]+/)
     .filter(Boolean)
-    .every(safeUrl);
+    .every((token) => !token.includes(":") || safeUrl(token));
 }
 
 /** True when this attribute must be removed from `el`. */
 export function attributeIsUnsafe(name: string, localName: string, value: string): boolean {
   const local = localName.toLowerCase();
   if (/^on/i.test(local) || /^on/i.test(name)) return true;
-  if (local === "style") return FORBIDDEN_STYLE.test(value);
+  // `style` is NOT judged here: sanitizeDocument runs it through the real CSS
+  // parser, which is the only thing that sees through escapes and var(). This
+  // used to run first and delete the whole attribute on a text match, so an
+  // honest page lost all its styling while an escaped payload got the precise
+  // treatment.
+  if (local === "style") return false;
   if (!URL_ATTRS.has(local)) return false;
   return local === "srcset" ? !safeSrcset(value) : !safeUrl(value);
 }
@@ -104,7 +148,19 @@ export function attributeIsUnsafe(name: string, localName: string, value: string
  */
 export function sanitizeDocument(doc: Document): void {
   for (const el of Array.from(doc.querySelectorAll("*"))) {
-    if (FORBIDDEN_ELEMENTS.has(el.localName.toLowerCase())) {
+    const name = el.localName.toLowerCase();
+    if (UNWRAP_ELEMENTS.has(name)) {
+      // The element is unsafe but its CONTENT is the article. Deleting the
+      // subtree silently blanked pages that wrap their body in a <form>, and
+      // dropped every <object>'s fallback text. Hoist the children instead.
+      const parent = el.parentNode;
+      if (parent) {
+        while (el.firstChild) parent.insertBefore(el.firstChild, el);
+      }
+      el.remove();
+      continue;
+    }
+    if (FORBIDDEN_ELEMENTS.has(name)) {
       el.remove();
       continue;
     }
@@ -139,21 +195,19 @@ function sanitizeStyleWithCssom(doc: Document, value: string): string | null {
     probe = doc.createElement("div");
     probe.style.cssText = value;
   } catch {
-    return null; // cannot verify it, so do not keep it
+    // No CSSOM to verify with (headless tests): fall back to the text screen.
+    return FORBIDDEN_STYLE.test(value) ? null : value;
   }
   const style = probe.style;
   for (let i = style.length - 1; i >= 0; i--) {
     const name = style.item(i);
-    const parsed = style.getPropertyValue(name).toLowerCase();
-    // url()/image-set() fetch from a remote host the moment the article paints.
-    if (parsed.includes("url(") || parsed.includes("image-set(")) {
+    if (!ALLOWED_STYLE_PROPS.has(name.toLowerCase())) {
       style.removeProperty(name);
       continue;
     }
-    // The article renders inside the live workspace document, so a fixed or
-    // sticky box can float over Obsidian's own UI — a ready-made phishing
-    // overlay wearing the app's chrome.
-    if (name.toLowerCase() === "position" && (parsed === "fixed" || parsed === "sticky")) {
+    // Belt and braces: an allowed property must still not fetch anything.
+    const parsed = style.getPropertyValue(name).toLowerCase();
+    if (parsed.includes("url(") || parsed.includes("image-set(") || parsed.includes("var(")) {
       style.removeProperty(name);
     }
   }

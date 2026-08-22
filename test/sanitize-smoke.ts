@@ -7,11 +7,13 @@
  */
 import assert from "node:assert";
 import {
+  ALLOWED_STYLE_PROPS,
   attributeIsUnsafe,
   sanitizeDocument,
   FORBIDDEN_ELEMENTS,
   safeSrcset,
   safeUrl,
+  UNWRAP_ELEMENTS,
 } from "../src/sanitize-html";
 
 // --- scheme normalization -------------------------------------------------
@@ -51,12 +53,23 @@ assert.equal(
   false,
   "a poisoned later srcset candidate is caught"
 );
-// Tokenizing on whitespace (as the real parser does) keeps comma-bearing data
-// URLs intact instead of splitting them into nonsense.
 assert.equal(
   safeSrcset("data:image/png;base64,iVBORw0KGgo= 1x"),
   true,
-  "a data URL containing a comma is one candidate, not two"
+  "a data URL containing a comma is still accepted"
+);
+// srcset ends a candidate at a comma, so a candidate can follow a descriptor
+// with no space. Splitting on whitespace alone yielded "1x,javascript:..." —
+// one token starting with a digit, matching no scheme, silently accepted.
+assert.equal(
+  safeSrcset("a.png 1x,javascript:alert(1) 2x"),
+  false,
+  "a candidate packed against a descriptor is still checked"
+);
+assert.equal(
+  safeSrcset("a.png 100w,app://local/Users/u/private.png 200w"),
+  false,
+  "and an absolute local path cannot be smuggled in after a descriptor"
 );
 
 // --- attribute filtering ---------------------------------------------------
@@ -76,22 +89,32 @@ assert.equal(attributeIsUnsafe("ping", "ping", "https://tracker.example"), false
 assert.equal(attributeIsUnsafe("href", "href", "notes/other.html"), false, "relative href kept");
 assert.equal(attributeIsUnsafe("title", "title", "javascript:"), false, "non-URL attrs untouched");
 
-// Inline styles: remote fetches and app-covering overlays are dropped.
+// Inline styles are no longer judged here at all: sanitizeDocument runs them
+// through the real CSS parser, which is the only thing that sees through
+// escapes and var() indirection. Judging them by text first meant an honest
+// page lost its whole style attribute while an escaped payload was handled
+// precisely.
 assert.equal(
   attributeIsUnsafe("style", "style", "background-image:url(https://evil.example/t.png)"),
-  true,
-  "url() in inline style is dropped (silent tracking beacon)"
-);
-assert.equal(
-  attributeIsUnsafe("style", "style", "position:fixed;top:0;left:0;width:100vw;height:100vh"),
-  true,
-  "fixed-position overlay is dropped (clickjacking over Obsidian's own UI)"
-);
-assert.equal(
-  attributeIsUnsafe("style", "style", "color: #c678dd; font-weight: bold"),
   false,
-  "ordinary inline styling survives"
+  "style is deferred to the CSSOM pass, not decided by a text match"
 );
+
+// The properties a reading view may keep. An allowlist, because a denylist
+// cannot survive `--p:fixed; position:var(--p)` — which computes to fixed while
+// serializing as var(--p), and was verified overlaying the whole viewport.
+for (const prop of ["color", "font-weight", "text-align", "background-color"]) {
+  assert.ok(ALLOWED_STYLE_PROPS.has(prop), `${prop} is keepable typography`);
+}
+for (const prop of ["position", "transform", "z-index", "background-image", "cursor", "--anything"]) {
+  assert.ok(!ALLOWED_STYLE_PROPS.has(prop), `${prop} cannot be kept`);
+}
+
+// Inert containers wrap real article text; dropping the subtree blanked pages.
+for (const el of ["form", "object", "noscript"]) {
+  assert.ok(UNWRAP_ELEMENTS.has(el), `<${el}> is unwrapped, keeping its content`);
+  assert.ok(!FORBIDDEN_ELEMENTS.has(el), `<${el}> is not deleted outright`);
+}
 
 // --- elements that can write attributes at runtime -------------------------
 // SMIL can animate a javascript: URL into an href AFTER sanitization, so the
@@ -99,8 +122,8 @@ assert.equal(
 for (const el of ["animate", "set", "animatetransform", "animatemotion", "discard"]) {
   assert.ok(FORBIDDEN_ELEMENTS.has(el), `<${el}> is removed (can write href at runtime)`);
 }
-for (const el of ["script", "style", "iframe", "object", "embed", "link", "base", "form"]) {
-  assert.ok(FORBIDDEN_ELEMENTS.has(el), `<${el}> is removed`);
+for (const el of ["script", "style", "iframe", "embed", "link", "base", "meta", "template"]) {
+  assert.ok(FORBIDDEN_ELEMENTS.has(el), `<${el}> is removed with its subtree`);
 }
 for (const el of ["use", "foreignobject"]) {
   assert.ok(FORBIDDEN_ELEMENTS.has(el), `<${el}> is removed (pulls in referenced content)`);
@@ -169,8 +192,8 @@ assert.equal(els[5].attr("src"), "pic.png", "a safe relative src survives");
 assert.equal(els[0].attr("title"), "javascript:not-a-url", "non-URL attributes are untouched");
 assert.equal(
   els[0].attr("style"),
-  undefined,
-  "an unverifiable style is dropped rather than trusted"
+  "color:#333",
+  "with no CSSOM available the text screen passes safe typography through"
 );
 
 console.log("html sanitize smoke test passed");

@@ -2627,6 +2627,8 @@ export class NativePdfOverlay {
     if (this.activeId === next) return;
     const prev = this.activeId;
     this.activeId = next;
+    // Tell the panel: it highlights this annotation and Delete removes it.
+    this.hub?.noteActiveAnnotationChanged(null);
     if (this.dynamicTagCardDependsOn(prev) || this.dynamicTagCardDependsOn(next)) {
       this.scheduleRailLayout();
     }

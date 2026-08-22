@@ -492,10 +492,14 @@ export class HtmlAnnotatorView extends FileView {
   }
 
   private setActive(id: string | null): void {
-    this.activeId = id && this.store?.get(id) ? id : null;
+    const next = id && this.store?.get(id) ? id : null;
+    const changed = next !== this.activeId;
+    this.activeId = next;
     for (const span of Array.from(this.bodyEl.querySelectorAll<HTMLElement>("span.lpa-html-mark"))) {
       span.toggleClass("is-active", span.dataset.hlId === this.activeId);
     }
+    // Tell the panel: it highlights this annotation and Delete removes it.
+    if (changed) this.hub?.noteActiveAnnotationChanged(null);
   }
 
   // ---- interactions ---------------------------------------------------------

@@ -98,6 +98,18 @@ export class AnnotationHub extends Events {
     }
   }
 
+  /**
+   * A source changed which annotation is selected.
+   *
+   * The panel highlights that annotation and the Delete key removes it, so the
+   * two must not drift: clicking a mark in the document has to reach the panel,
+   * and no other hub event fires for it.
+   */
+  noteActiveAnnotationChanged(src: AnnotationSource | null): void {
+    if (src && this.sources.get(src.key) !== src) return;
+    this.trigger("annotations-changed", src ?? this.active);
+  }
+
   get active(): AnnotationSource | null {
     return this.activeKey ? this.sources.get(this.activeKey) ?? null : null;
   }

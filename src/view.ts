@@ -948,8 +948,11 @@ export class PdfAnnotatorView extends FileView {
     options: { scrollSidebar?: boolean; focusNote?: boolean } = {}
   ): void {
     const prev = this.activeHighlightId;
+    const previous = this.activeHighlightId;
     this.activeHighlightId = id;
     if (id && !this.store?.get(id)) this.activeHighlightId = null;
+    // Tell the panel: it highlights this annotation and Delete removes it.
+    if (previous !== this.activeHighlightId) this.hub?.noteActiveAnnotationChanged(null);
     const needsRender =
       this.dynamicTagCardDependsOn(prev) ||
       this.dynamicTagCardDependsOn(this.activeHighlightId) ||
