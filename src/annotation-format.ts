@@ -27,7 +27,14 @@ export function annotationKindLabel(h: Highlight): string {
 
 export function shortAnnotationText(text: string, max: number): string {
   const clean = text.replace(/\s+/g, " ").trim();
-  return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
+  if (clean.length <= max) return clean;
+  if (max <= 1) return "…";
+  // Slice by code POINT: cutting between surrogates emits a lone half that
+  // renders as U+FFFD, which any emoji or astral CJK on the boundary triggers.
+  let cut = max - 1;
+  const code = clean.charCodeAt(cut - 1);
+  if (code >= 0xd800 && code <= 0xdbff) cut--;
+  return clean.slice(0, cut) + "…";
 }
 
 export function rollPrimaryText(h: Highlight): string {

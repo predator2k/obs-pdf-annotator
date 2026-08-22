@@ -508,11 +508,15 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.nativeOverlays.refreshUi();
   }
 
-  /** Exports must be user-visible: a hidden annotation folder gets a
-   * dedicated visible export folder instead. */
+  /**
+   * Exports live in their own visible top-level folder, never inside the
+   * annotation folder. They must be user-visible (the default annotation folder
+   * is hidden, so Obsidian would not index them), and keeping the two
+   * namespaces apart is what guarantees an export can never be written on top
+   * of a live sidecar.
+   */
   exportFolder(): string {
-    const folder = this.settings.annotationStorageFolder;
-    return folder.startsWith(".") ? "PDF exports" : `${folder}/Exports`;
+    return "PDF exports";
   }
 
   annotationPathOptions(): AnnotationPathOptions {

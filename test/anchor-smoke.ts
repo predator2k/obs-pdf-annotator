@@ -1,36 +1,78 @@
-import { parseLegacyNote, targetBasename } from "../src/legacy-import";
-import { buildDocIndex, anchorQuote } from "../src/anchor";
-const pdfjs = require("pdfjs-dist/legacy/build/pdf.js");
-const fs = require("fs"); const path = require("path");
-const ROOT = "/Users/tianchenhao/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian";
-function allPdfs(dir: string, acc: string[] = []): string[] {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith(".")) continue;
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) allPdfs(p, acc);
-    else if (e.name.toLowerCase().endsWith(".pdf")) acc.push(p);
-  }
-  return acc;
-}
-const PDFS = allPdfs(ROOT);
-const resolvePdf = (t?: string) => { const b = targetBasename(t); return b ? PDFS.find(p => path.basename(p).normalize("NFC").toLowerCase() === b) : undefined; };
-async function run(noteRel: string) {
-  const parsed = parseLegacyNote(fs.readFileSync(path.join(ROOT, noteRel), "utf8"));
-  const pdf = resolvePdf(parsed.target);
-  if (!pdf) { console.log(`=== ${noteRel}: PDF NOT FOUND`); return; }
-  const doc = await pdfjs.getDocument({ data: new Uint8Array(fs.readFileSync(pdf)), verbosity: 0 }).promise;
-  const di = await buildDocIndex(doc);
-  let matched = 0, crosspage = 0;
-  const misses: string[] = [];
-  for (const a of parsed.annotations) {
-    const rs = anchorQuote(di, a.exact, a.prefix, a.suffix);
-    if (rs.length) { matched++; if (rs.length > 1) crosspage++; }
-    else misses.push(a.exact.slice(0, 30).replace(/\n/g, " "));
-  }
-  console.log(`=== ${noteRel}  matched ${matched}/${parsed.annotations.length}  (cross-page: ${crosspage})`);
-  misses.forEach(m => console.log(`      miss: "${m}…"`));
-  await doc.destroy();
-}
-(async () => {
-  for (const n of ["读书批注A/意崇.md","文献批注/剑批史 Formalism to Poststructuralism v8.md","读书批注B/有限性之后.md","读书批注B/弗洛伊德.md"]) await run(n);
-})().catch(e => { console.error("FAIL", e); process.exit(1); });
+/**
+ * anchor-smoke.ts — the shared text-anchoring core.
+ *
+ * These functions decide where a highlight lands and which words a copied link
+ * points at, so a wrong answer here is silently wrong data, not a crash.
+ */
+import assert from "node:assert";
+import { findBestMatch, findDriftSpan, normChar, normStr } from "../src/anchor";
+import { findSelectionInChunks } from "../src/pdf-link";
+
+// --- normalization ---------------------------------------------------------
+assert.equal(normStr("The  quick\nbrown"), "thequickbrown", "whitespace is dropped");
+assert.equal(normStr("co-\noperate"), "cooperate", "line-break hyphenation is dropped");
+assert.equal(normStr("“quoted”"), '"quoted"', "curly quotes fold to ASCII");
+assert.equal(normChar("­"), "", "soft hyphen dropped");
+
+// Invisible bidi/format controls must not block a match: a PDF text layer and
+// a copied quote rarely agree on them.
+assert.equal(normChar("‎"), "", "LRM dropped");
+assert.equal(normChar("‏"), "", "RLM dropped");
+assert.equal(normChar("‪"), "", "LRE dropped");
+assert.equal(normChar("⁦"), "", "LRI dropped");
+assert.equal(normChar("⁠"), "", "word joiner dropped");
+assert.equal(normStr("abc‎def"), "abcdef", "a bidi mark mid-word still anchors");
+assert.ok(
+  findSelectionInChunks(["abc‎def ghi"], "abcdef"),
+  "text containing a bidi mark is locatable"
+);
+
+// --- empty needle must not hang the UI thread ------------------------------
+// "abcabc".indexOf("", 7) clamps to 6 instead of returning -1, which makes the
+// occurrence scan a fixed point.
+assert.equal(findBestMatch("abcabc", ""), null, "empty needle returns null, not a hang");
+assert.equal(findDriftSpan("abcabc", ""), null, "empty needle has no drift span");
+
+// --- repeated passages are reported as ambiguous ---------------------------
+const repeated = findBestMatch("alphabetagamma.filler.alphabetagamma", "alphabetagamma");
+assert.ok(repeated, "a repeated passage still matches");
+assert.equal(repeated!.ambiguous, true, "two equally-scored occurrences are flagged ambiguous");
+assert.equal(
+  findSelectionInChunks(["alpha beta gamma. filler. alpha beta gamma."], "alpha beta gamma"),
+  null,
+  "an ambiguous quote degrades to a page link instead of guessing an occurrence"
+);
+
+// Context resolves the ambiguity, and then the link is emitted.
+const disambiguated = findSelectionInChunks(
+  ["alpha beta gamma. filler. alpha beta gamma."],
+  "alpha beta gamma",
+  "filler. "
+);
+assert.ok(disambiguated, "prefix context picks an occurrence");
+assert.equal(disambiguated!.beginOffset, 26, "and it is the SECOND occurrence, not the first");
+
+// A unique quote is never ambiguous.
+const unique = findBestMatch("onlyoncehere", "once");
+assert.ok(unique && !unique.ambiguous, "a single occurrence is unambiguous");
+
+// --- the drift fallback must not swallow unselected material ---------------
+const quote =
+  "In the second chapter the author develops a theory of value that explains " +
+  "how labour time becomes the measure of exchange in a market society";
+const inserted =
+  "In the second chapter the author develops a theory of value that explains " +
+  " XXXXXXXXXX INSERTED DRIFT MATERIAL THAT WAS NEVER SELECTED XXXXXXXXXX " +
+  "how labour time becomes the measure of exchange in a market society";
+assert.equal(
+  findSelectionInChunks([inserted], quote),
+  null,
+  "a head/tail pair separated by unselected material is rejected, not linked"
+);
+
+// Genuine minor drift (a ligature expanding) still anchors through the fallback.
+const drifted = "the ﬁrst deﬁnition of the term appears in the preface";
+const asTyped = "the first definition of the term appears in the preface";
+assert.ok(findSelectionInChunks([drifted], asTyped), "ligature drift still anchors");
+
+console.log("anchor smoke test passed");

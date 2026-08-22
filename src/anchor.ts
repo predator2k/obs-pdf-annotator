@@ -50,6 +50,11 @@ export function normChar(c: string): string {
   const code = c.charCodeAt(0);
   if (code === 0x00ad || code === 0x200b || code === 0x200c || code === 0x200d || code === 0xfeff)
     return "";
+  // Invisible formatting controls: bidi marks/isolates and the word joiner.
+  // A PDF text layer and a copied quote rarely agree on these, and leaving them
+  // in makes every RTL or mixed-direction passage fail to anchor.
+  if (code === 0x2060 || (code >= 0x200e && code <= 0x200f) || (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069))
+    return "";
   if (c === "‘" || c === "’" || c === "‚" || c === "‛" || c === "ʼ") return "'";
   if (c === "“" || c === "”" || c === "„" || c === "‟" || c === "«" || c === "»") return '"';
   // Drop hyphens/dashes: line-break hyphenation differs between pdf.js versions.
@@ -108,8 +113,13 @@ function itemHRange(b: ItemBox, fromCh: number, toChInclusive: number): [number,
   // outward by half a character: a highlight may overshoot slightly but
   // never cuts characters the user actually selected.
   const pad = 0.5;
+  // `toChInclusive` is the code-unit offset where the last selected character
+  // STARTS; an astral character occupies two units, so advancing by one would
+  // stop half a surrogate pair short and visibly cut the final glyph.
+  const lastCp = b.str.codePointAt(toChInclusive);
+  const endUnit = toChInclusive + (lastCp !== undefined && lastCp > 0xffff ? 2 : 1);
   const f = Math.max(0, Math.min(1, (fromCh === 0 ? 0 : fromCh - pad) / len));
-  const t = Math.max(0, Math.min(1, (toChInclusive + 1 + (toChInclusive >= len - 1 ? 0 : pad)) / len));
+  const t = Math.max(0, Math.min(1, (endUnit + (endUnit >= len ? 0 : pad)) / len));
   return [b.x + f * b.w, b.x + t * b.w];
 }
 
@@ -197,19 +207,33 @@ export function findBestMatch(
   needle: string,
   nPrefix?: string,
   nSuffix?: string
-): { start: number; end: number } | null {
+): { start: number; end: number; ambiguous: boolean } | null {
+  // `"abc".indexOf("", n)` clamps to the string length instead of returning -1,
+  // so an empty needle makes the scan below a fixed point and hangs the UI
+  // thread. Callers each guard this today; the shared function must not rely
+  // on that.
+  if (!needle) return null;
   let best: { start: number; end: number; score: number } | null = null;
+  // How many occurrences tie for the top score: with no distinguishing context
+  // the "best" match is just the first one found, which callers that build
+  // durable links need to know about.
+  let ties = 0;
   let from = 0;
   for (;;) {
     const at = search.indexOf(needle, from);
     if (at < 0) break;
     const end = at + needle.length - 1;
     const score = contextScore(search, at, end, nPrefix, nSuffix);
-    if (!best || score > best.score) best = { start: at, end, score };
+    if (!best || score > best.score) {
+      best = { start: at, end, score };
+      ties = 1;
+    } else if (score === best.score) {
+      ties++;
+    }
     if (best.score >= 4) break;
     from = at + 1;
   }
-  return best ? { start: best.start, end: best.end } : null;
+  return best ? { start: best.start, end: best.end, ambiguous: ties > 1 } : null;
 }
 
 /**
@@ -228,8 +252,14 @@ export function findDriftSpan(
   if (needle.length < hlen) return null;
   const head = needle.slice(0, hlen);
   const tail = needle.slice(-hlen);
-  const lo = needle.length * 0.6;
-  const hi = needle.length * 1.6;
+  // This fallback exists for MINOR internal drift (ligatures, hyphenation),
+  // which normalization already collapses to a few characters either way. A
+  // generous window instead lets a head matched early pair with a tail matched
+  // much later, and the accepted span then swallows whole sentences the user
+  // never selected — silently, since the caller is told this is a confident
+  // match. Keep the window tight enough that only real drift fits.
+  const lo = needle.length * 0.8;
+  const hi = needle.length * 1.2;
   let fb: { start: number; end: number; score: number } | null = null;
   let from = 0;
   for (;;) {

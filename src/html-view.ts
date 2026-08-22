@@ -32,6 +32,7 @@ import { findBestMatch, normChar, normStr } from "./anchor";
 import { annotationTypeOf } from "./annotation-format";
 import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
 import { mayHandleDocumentKeys, type AnnotationHub } from "./annotation-hub";
+import { sanitizeDocument } from "./sanitize-html";
 
 export const VIEW_TYPE_HTML_ANNOTATOR = "lpa-html-annotator";
 
@@ -117,6 +118,11 @@ export class HtmlAnnotatorView extends FileView {
   async onLoadFile(file: TFile): Promise<void> {
     this.teardown();
     const raw = await this.app.vault.read(file);
+    // Obsidian can start loading another file before this one settles; without
+    // the guard the render, the store, and the hub registration can end up
+    // describing three different documents — and the rename path would then
+    // flush one document's annotations into another's sidecar.
+    if (this.file !== file) return;
     this.renderHtml(raw, file);
 
     const options = this.getAnnotationPathOptions();
@@ -127,11 +133,15 @@ export class HtmlAnnotatorView extends FileView {
       file.basename,
       file.path,
       undefined,
-      [],
+      // The rolling backup is written on every save, so it must also be READ:
+      // otherwise an interrupted write leaves the reader empty while a perfect
+      // recovery copy sits unused beside it.
+      [paths.backupPath],
       false,
       paths.backupPath
     );
     await this.store.load();
+    if (this.file !== file) return;
     this.paintAll();
 
     if (this.hub && this.store) {
@@ -271,30 +281,23 @@ export class HtmlAnnotatorView extends FileView {
 
   private renderHtml(raw: string, file: TFile): void {
     const doc = new DOMParser().parseFromString(raw, "text/html");
-    // Strip active content wholesale.
-    // Styles are removed too: the article renders in the LIVE workspace
-    // document, so page CSS would restyle all of Obsidian, and stylesheet
-    // links would fetch remote resources from inside the app.
-    doc
-      .querySelectorAll("script, style, link, iframe, object, embed, form, base, meta[http-equiv]")
-      .forEach((el) => el.remove());
-    for (const el of Array.from(doc.querySelectorAll<HTMLElement>("*"))) {
-      for (const attr of Array.from(el.attributes)) {
-        if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
-        else if (/^(href|src|xlink:href)$/i.test(attr.name) && /^\s*javascript:/i.test(attr.value)) {
-          el.removeAttribute(attr.name);
-        }
-      }
-    }
+    sanitizeDocument(doc);
+
     // Resolve relative image sources against the file's folder.
     const folder = file.parent?.path && file.parent.path !== "/" ? file.parent.path : "";
     for (const img of Array.from(doc.querySelectorAll<HTMLImageElement>("img[src]"))) {
       const src = img.getAttribute("src") ?? "";
       if (/^(https?:|data:|blob:|app:)/i.test(src)) continue;
       const clean = src.replace(/^\.\//, "").split("?")[0].split("#")[0];
-      const target = this.app.vault.getAbstractFileByPath(
-        folder ? `${folder}/${decodeURIComponent(clean)}` : decodeURIComponent(clean)
-      );
+      // A stray '%' (e.g. "chart-100%.png") makes decodeURIComponent throw;
+      // an unresolvable image must never abort the whole render.
+      let decoded = clean;
+      try {
+        decoded = decodeURIComponent(clean);
+      } catch {
+        /* use the raw form */
+      }
+      const target = this.app.vault.getAbstractFileByPath(folder ? `${folder}/${decoded}` : decoded);
       if (target instanceof TFile) img.src = this.app.vault.getResourcePath(target);
     }
 

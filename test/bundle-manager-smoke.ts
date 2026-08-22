@@ -429,12 +429,162 @@ async function testRenameConflict(): Promise<void> {
   console.log("rename conflict: ok");
 }
 
+/** Renaming a document that has NO sidecar onto a path whose sidecar slot is
+ * occupied must still preserve the occupant: the renamed document's store is
+ * repointed at that path and would overwrite it on the next save. */
+async function testRenameOntoOccupiedWithoutSource(): Promise<void> {
+  const vault = new MemoryVault();
+  const docB = annotationDoc("Library/paper.pdf", "fp-b", "b01", "doc B note");
+  const toPaths = pathModeSidecarPaths("Library/paper.pdf", OPTIONS);
+  await vault.adapter.write(toPaths.annotationPath, serializeAnnotations(docB, "paper"));
+
+  // Inbox/scan.pdf was never annotated, so no source sidecar exists.
+  await moveSidecarsForRename(vault.adapter as any, "Inbox/scan.pdf", "Library/paper.pdf", OPTIONS);
+
+  const conflictFiles = [...vault.adapter.text.keys()].filter((p) =>
+    p.includes(".annotations.conflict-")
+  );
+  assert.equal(conflictFiles.length, 1, "occupant preserved even with no source sidecar");
+  assert.ok(
+    (await vault.adapter.read(conflictFiles[0])).includes("b01"),
+    "snapshot holds the occupant's annotations"
+  );
+  assert.equal(
+    await vault.adapter.exists(toPaths.annotationPath),
+    false,
+    "destination slot is cleared for the renamed document"
+  );
+  console.log("rename onto occupied slot: ok");
+}
+
+/** A case-only rename is the same file on macOS/Windows; it must not be
+ * mistaken for a collision and set aside. */
+async function testCaseOnlyRename(): Promise<void> {
+  const vault = new MemoryVault();
+  const doc = annotationDoc("Books/A.pdf", "fp-a", "a01", "note");
+  const from = pathModeSidecarPaths("Books/A.pdf", OPTIONS);
+  await vault.adapter.write(from.annotationPath, serializeAnnotations(doc, "A"));
+  await vault.adapter.write(from.backupPath, serializeAnnotations(doc, "A"));
+
+  await moveSidecarsForRename(vault.adapter as any, "Books/A.pdf", "books/A.pdf", OPTIONS);
+
+  const conflicts = [...vault.adapter.text.keys()].filter((p) => p.includes(".conflict-"));
+  assert.equal(conflicts.length, 0, "a case-only change creates no conflict snapshot");
+  const surviving = [...vault.adapter.text.keys()].filter((p) => p.endsWith(".annotations.md"));
+  assert.equal(surviving.length, 1, "the sidecar still exists exactly once");
+  assert.ok((await vault.adapter.read(surviving[0])).includes("a01"), "annotations intact");
+  assert.ok(
+    [...vault.adapter.text.keys()].some((p) => p.endsWith(".annotations.previous.md")),
+    "the rolling backup was not deleted"
+  );
+  console.log("case-only rename: ok");
+}
+
+/** An edit made WHILE a save is in flight must still reach disk. */
+async function testEditDuringFlush(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Books/A.pdf", OPTIONS);
+  const store = new AnnotationStore(
+    vault.adapter as any,
+    paths.annotationPath,
+    "A",
+    "Books/A.pdf",
+    "fp-a",
+    [],
+    false,
+    paths.backupPath
+  );
+  store.add({ id: "h1", page: 0, color: "#ffd400", text: "first", created: "t0" } as any);
+
+  const inFlight = store.flush();
+  // Lands while the write above is still awaiting adapter round-trips.
+  store.add({ id: "h2", page: 0, color: "#ffd400", text: "second", created: "t1" } as any);
+  await inFlight;
+  await store.flush();
+
+  const written = await vault.adapter.read(paths.annotationPath);
+  assert.ok(written.includes("h1"), "the first annotation is saved");
+  assert.ok(written.includes("h2"), "the annotation added mid-save is NOT swallowed");
+  console.log("edit during flush: ok");
+}
+
+/** A second writer's annotations must survive our whole-file rewrite. */
+async function testMergeForeignAnnotations(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Books/A.pdf", OPTIONS);
+  const makeStore = () =>
+    new AnnotationStore(
+      vault.adapter as any,
+      paths.annotationPath,
+      "A",
+      "Books/A.pdf",
+      "fp-a",
+      [],
+      false,
+      paths.backupPath
+    );
+
+  // Two panes on the same document, each with its own store.
+  const paneA = makeStore();
+  const paneB = makeStore();
+  await paneA.load();
+  await paneB.load();
+
+  paneA.add({ id: "hA", page: 0, color: "#ffd400", text: "from A", created: "t0" } as any);
+  await paneA.flush();
+  paneB.add({ id: "hB", page: 1, color: "#ff6666", text: "from B", created: "t1" } as any);
+  await paneB.flush();
+
+  const written = await vault.adapter.read(paths.annotationPath);
+  assert.ok(written.includes("hB"), "the second pane's annotation is saved");
+  assert.ok(written.includes("hA"), "the first pane's annotation is NOT destroyed");
+
+  // A deletion must not be undone by the merge.
+  paneB.remove("hA");
+  await paneB.flush();
+  const afterDelete = await vault.adapter.read(paths.annotationPath);
+  assert.ok(!afterDelete.includes("hA"), "an explicit deletion is not resurrected by the merge");
+  console.log("merge foreign annotations: ok");
+}
+
+/** The sidecar invites prose edits, so a user's own json fence must not make
+ * the file look corrupt. */
+async function testUserJsonFenceBelowBlock(): Promise<void> {
+  const vault = new MemoryVault();
+  const paths = pathModeSidecarPaths("Books/A.pdf", OPTIONS);
+  const doc = annotationDoc("Books/A.pdf", "fp-a", "a01", "real annotation");
+  const withUserBlock =
+    serializeAnnotations(doc, "A") +
+    '\n\n## My reading notes\n\n```json\n{ "unrelated": true }\n```\n';
+  await vault.adapter.write(paths.annotationPath, withUserBlock);
+
+  const store = new AnnotationStore(
+    vault.adapter as any,
+    paths.annotationPath,
+    "A",
+    "Books/A.pdf",
+    "fp-a",
+    [],
+    false,
+    paths.backupPath
+  );
+  await store.load();
+  assert.equal(store.doc.highlights.length, 1, "the managed block is found above the user's fence");
+  assert.equal(store.doc.highlights[0].id, "a01", "and it is the real annotation data");
+  console.log("user json fence below the managed block: ok");
+}
+
 async function main(): Promise<void> {
   await testPathMode();
   await testHashMode();
   await testStoredCopyCleanup();
   await testUpgradePromotion();
   await testRenameConflict();
+  await testRenameOntoOccupiedWithoutSource();
+  await testCaseOnlyRename();
+  await testEditDuringFlush();
+  await testMergeForeignAnnotations();
+  await testUserJsonFenceBelowBlock();
   console.log("bundle manager smoke test passed");
 }
 

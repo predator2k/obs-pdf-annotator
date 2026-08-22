@@ -25,6 +25,7 @@
  */
 import { App, TFile, normalizePath } from "obsidian";
 import {
+  DEFAULT_ANNOTATION_FOLDER,
   LEGACY_DEFAULT_ANNOTATION_FOLDER,
   legacySidecarPathFor,
   parseAnnotations,
@@ -398,7 +399,13 @@ export class PdfBundleManager {
     if (!sourcePath) throw new Error("No annotations exist for this PDF.");
 
     const folder = normalizePath(exportFolder).replace(/^\/+|\/+$/g, "");
-    const exportPath = normalizePath(`${folder}/${file.basename}${suffix}.annotations.md`);
+    // Mirror the PDF's vault path inside the export folder. A flat
+    // `${folder}/${basename}` namespace silently overwrites the previous export
+    // whenever two PDFs in different folders share a basename — and, if the
+    // export folder ever sits inside the annotation folder, it can land exactly
+    // on another document's LIVE sidecar.
+    const parent = file.parent?.path && file.parent.path !== "/" ? `${file.parent.path}/` : "";
+    const exportPath = normalizePath(`${folder}/${parent}${file.basename}${suffix}.annotations.md`);
     // The marker keeps snapshots out of the fingerprint rescue index.
     const content = withExportMarker(await adapter.read(sourcePath));
     // Vault APIs so the folder and file are indexed immediately
@@ -520,9 +527,16 @@ export class PdfBundleManager {
       storageMode: "folder",
       storageFolder: LEGACY_DEFAULT_ANNOTATION_FOLDER,
     });
+    // The shipping default stays a candidate even after the user points the
+    // setting somewhere else, or every sidecar written so far would drop out of
+    // reach the moment the folder is changed.
+    const shippedDefault = sidecarPathFor(pdfPath, {
+      storageMode: "folder",
+      storageFolder: DEFAULT_ANNOTATION_FOLDER,
+    });
     const configured = sidecarPathFor(pdfPath, options);
     const beside = legacySidecarPathFor(pdfPath);
-    const direct = uniquePaths([configured, central, legacyCentral, beside]).filter(
+    const direct = uniquePaths([configured, central, legacyCentral, shippedDefault, beside]).filter(
       (path) => path !== canonicalPath
     );
 
@@ -534,7 +548,11 @@ export class PdfBundleManager {
     // A unique fingerprint match recovers an old sidecar after the PDF was
     // already renamed or moved before this storage system was installed.
     if (fingerprint) {
-      const index = await this.getLegacyFingerprintIndex();
+      const index = await this.getLegacyFingerprintIndex([
+        options.storageFolder ?? DEFAULT_ANNOTATION_FOLDER,
+        DEFAULT_ANNOTATION_FOLDER,
+        LEGACY_DEFAULT_ANNOTATION_FOLDER,
+      ]);
       const fingerprintMatches = (index.get(fingerprint) ?? []).filter(
         (path) => path !== canonicalPath && !existing.includes(path)
       );
@@ -574,23 +592,57 @@ export class PdfBundleManager {
     }
   }
 
-  private async getLegacyFingerprintIndex(): Promise<Map<string, string[]>> {
+  /**
+   * Every sidecar-looking Markdown file in the vault, including the ones the
+   * vault index cannot see.
+   *
+   * `getMarkdownFiles()` never returns anything under a dot-folder, and the
+   * default annotation folder IS one (`.pdf-annotate`) — so the fingerprint
+   * rescue below, whose whole job is finding a sidecar after its PDF moved
+   * outside Obsidian, would be structurally blind to every sidecar this
+   * version writes. Walk the annotation folders through the adapter and merge.
+   */
+  private async sidecarCandidateFiles(roots: string[]): Promise<string[]> {
+    const paths = new Set<string>();
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path.toLowerCase().endsWith(".annotations.md")) paths.add(file.path);
+    }
+    const adapter = this.app.vault.adapter;
+    const walk = async (folder: string, depth: number): Promise<void> => {
+      if (depth > 12) return;
+      let listing: { files: string[]; folders: string[] };
+      try {
+        if (!(await adapter.exists(folder))) return;
+        listing = await adapter.list(folder);
+      } catch {
+        return;
+      }
+      for (const file of listing.files) {
+        if (file.toLowerCase().endsWith(".annotations.md")) paths.add(file);
+      }
+      for (const sub of listing.folders) await walk(sub, depth + 1);
+    };
+    for (const root of new Set(roots.filter(Boolean))) await walk(normalizePath(root), 0);
+    return [...paths];
+  }
+
+  private async getLegacyFingerprintIndex(roots: string[]): Promise<Map<string, string[]>> {
     if (this.legacyFingerprintIndex) return this.legacyFingerprintIndex;
     const index = new Map<string, string[]>();
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      if (!file.path.toLowerCase().endsWith(".annotations.md")) continue;
+    for (const path of await this.sidecarCandidateFiles(roots)) {
       // Export snapshots share the document fingerprint; counting them would
       // make the uniqueness-gated rescue veto itself (or worse, adopt a stale
       // snapshot). Post-marker snapshots are caught by content below; the one
       // path arm covers pre-marker snapshots at the legacy default location.
-      if (file.path.startsWith(`${LEGACY_DEFAULT_ANNOTATION_FOLDER}/Exports/`)) continue;
+      if (path.startsWith(`${LEGACY_DEFAULT_ANNOTATION_FOLDER}/Exports/`)) continue;
       try {
-        const content = await this.app.vault.cachedRead(file);
+        // Adapter, not cachedRead: hidden-folder sidecars have no TFile.
+        const content = await this.app.vault.adapter.read(path);
         if (content.slice(0, 600).includes(EXPORT_MARKER)) continue; // export snapshot
         const parsed = parseAnnotations(content);
         if (!parsed?.fingerprint) continue;
         const paths = index.get(parsed.fingerprint) ?? [];
-        paths.push(file.path);
+        paths.push(path);
         index.set(parsed.fingerprint, paths);
       } catch {
         /* A malformed legacy file must not block opening unrelated PDFs. */

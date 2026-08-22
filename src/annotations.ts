@@ -413,16 +413,37 @@ export async function moveSidecarsForRename(
   const to = pathModeSidecarPaths(newPdfPath, options);
   if (from.annotationPath === to.annotationPath) return;
 
+  // A case-only change is the SAME file on macOS/Windows. Treating it as a move
+  // would set the live sidecar aside as a "conflict" and delete its backup, so
+  // leave both alone: the existing file already answers to the new path there,
+  // and on a case-sensitive filesystem the move loop below still runs.
+  if (from.annotationPath.toLowerCase() === to.annotationPath.toLowerCase()) {
+    for (const [src, dst] of [
+      [from.annotationPath, to.annotationPath],
+      [from.backupPath, to.backupPath],
+    ] as Array<[string, string]>) {
+      try {
+        if ((await adapter.exists(src)) && !(await adapter.exists(dst))) {
+          await ensureFolderForFile(adapter, dst);
+          await adapter.rename(src, dst);
+        }
+      } catch (e) {
+        console.error(`[local-pdf-annotator] failed to re-case sidecar ${src} -> ${dst}`, e);
+      }
+    }
+    return;
+  }
+
   // A sidecar already at the destination belongs to a DIFFERENT document that
   // once lived at the new path. It must not stay there (the renamed PDF's
   // store will save there next), and it must not be overwritten silently —
-  // set it aside as a timestamped conflict snapshot.
+  // set it aside as a timestamped conflict snapshot. This holds even when the
+  // renamed document has no sidecar of its own: its store is repointed at the
+  // destination either way, so leaving the old occupant in place would let the
+  // next save destroy it.
   try {
-    if (
-      (await adapter.exists(from.annotationPath)) &&
-      (await adapter.exists(to.annotationPath))
-    ) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    if (await adapter.exists(to.annotationPath)) {
       const aside = to.annotationPath.replace(
         /\.annotations\.md$/,
         `.annotations.conflict-${stamp}.md`
@@ -431,9 +452,21 @@ export async function moveSidecarsForRename(
       console.warn(
         `[local-pdf-annotator] a different document's sidecar occupied ${to.annotationPath}; preserved it as ${aside}`
       );
-    }
-    if ((await adapter.exists(from.backupPath)) && (await adapter.exists(to.backupPath))) {
-      // Rolling backups are disposable; the incoming one wins.
+      // Its rolling backup is the older half of the same recovery pair. Keep it
+      // beside the snapshot rather than deleting it — if the set-aside sidecar
+      // turns out to be the corrupt one, this is the only way back.
+      if (await adapter.exists(to.backupPath)) {
+        await adapter.rename(
+          to.backupPath,
+          to.backupPath.replace(
+            /\.annotations\.previous\.md$/,
+            `.annotations.conflict-${stamp}.previous.md`
+          )
+        );
+      }
+    } else if ((await adapter.exists(from.backupPath)) && (await adapter.exists(to.backupPath))) {
+      // No sidecar at the destination, so this stray backup has nothing to
+      // recover; the incoming rolling backup wins.
       await adapter.remove(to.backupPath);
     }
   } catch (e) {
@@ -501,20 +534,32 @@ export function serializeAnnotations(doc: AnnotationDoc, pdfBasename: string): s
   return lines.join("\n");
 }
 
-/** Extract the last ```json fenced block and parse it. Tolerant of missing/garbled files. */
+/**
+ * Extract the annotation document from a sidecar's ```json fenced block.
+ * Tolerant of missing/garbled files.
+ *
+ * The sidecar invites the user to edit the prose around the managed block, so
+ * their own text may contain json fences too. Scan fences newest-first and take
+ * the first one that actually parses as an annotation document, rather than
+ * declaring the file corrupt because the LAST fence happens to be a snippet the
+ * user pasted below ours — that misjudgement would fall back to the rolling
+ * backup and then overwrite the newer real data with it.
+ */
 export function parseAnnotations(content: string): AnnotationDoc | null {
   const fenceRe = /```json\s*\n([\s\S]*?)\n```/g;
   let match: RegExpExecArray | null;
-  let last: string | null = null;
-  while ((match = fenceRe.exec(content)) !== null) last = match[1];
-  if (!last) return null;
-  try {
-    const parsed = JSON.parse(last);
-    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.highlights)) return null;
-    return parsed as AnnotationDoc;
-  } catch {
-    return null;
+  const blocks: string[] = [];
+  while ((match = fenceRe.exec(content)) !== null) blocks.push(match[1]);
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(blocks[i]);
+      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.highlights)) continue;
+      return parsed as AnnotationDoc;
+    } catch {
+      /* not our block — keep looking further up the file */
+    }
   }
+  return null;
 }
 
 /**
@@ -525,6 +570,9 @@ export class AnnotationStore {
   /** Fired on every store mutation (single choke point: markDirty). */
   onChange: (() => void) | null = null;
   private dirty = false;
+  private flushing: Promise<void> | null = null;
+  /** Ids this store deleted, so a merge never resurrects them. */
+  private removedIds = new Set<string>();
   private flushDebounced: () => void;
 
   constructor(
@@ -562,7 +610,12 @@ export class AnnotationStore {
         );
       }
       this.doc.highlights = parsed.highlights;
-      if (parsed.fingerprint) this.doc.fingerprint = parsed.fingerprint;
+      // Adopt the stored fingerprint ONLY when the live document's is unknown.
+      // Overwriting a known-live fingerprint with the stored one would make the
+      // sidecar permanently misreport its document after any content edit, and
+      // every fingerprint-gated rescue (rolling backup, legacy sidecar, hash
+      // bundle) would then refuse to match for the rest of the file's life.
+      if (!this.doc.fingerprint && parsed.fingerprint) this.doc.fingerprint = parsed.fingerprint;
       // Managed bundles use a stable canonical sidecar. When annotations are
       // first found in an old path-derived sidecar, copy them into the bundle
       // immediately instead of waiting for the next user edit. A failed copy
@@ -598,6 +651,8 @@ export class AnnotationStore {
     const i = this.doc.highlights.findIndex((h) => h.id === id);
     if (i >= 0) {
       this.doc.highlights.splice(i, 1);
+      // Remember the deletion so a merge cannot resurrect it (see writeOnce).
+      this.removedIds.add(id);
       this.markDirty();
     }
   }
@@ -632,27 +687,73 @@ export class AnnotationStore {
   }
 
   async flush(): Promise<void> {
+    // Serialize concurrent flushes. Two overlapping writes (debounced save vs.
+    // rename-follow vs. teardown) could otherwise interleave and land the older
+    // snapshot last, and both would roll the backup independently.
+    const previous = this.flushing ?? Promise.resolve();
+    const mine = previous.catch(() => {}).then(() => this.writeOnce());
+    this.flushing = mine;
+    try {
+      await mine;
+    } finally {
+      if (this.flushing === mine) this.flushing = null;
+    }
+  }
+
+  private async writeOnce(): Promise<void> {
     if (!this.dirty) return;
-    const out = serializeAnnotations(this.doc, this.pdfBasename);
+    // Clear BEFORE awaiting: an edit that lands during the writes below must
+    // leave the flag set and get its own flush. Clearing afterwards would
+    // swallow that edit — the debounced retry and the unload flush would both
+    // see a clean store and skip.
+    this.dirty = false;
     try {
       await this.ensureParentFolder(this.sidecarPath);
-      if (this.sidecarBackupPath && (await this.adapter.exists(this.sidecarPath))) {
+      if (await this.adapter.exists(this.sidecarPath)) {
         const current = await this.adapter.read(this.sidecarPath);
+        const parsed = parseAnnotations(current);
         // Never replace the last-known-good recovery copy with a corrupt or
         // partially-written canonical sidecar.
-        if (parseAnnotations(current)) {
-          await this.ensureParentFolder(this.sidecarBackupPath);
-          await this.adapter.write(this.sidecarBackupPath, current);
+        if (parsed) {
+          this.mergeForeignHighlights(parsed.highlights);
+          if (this.sidecarBackupPath) {
+            await this.ensureParentFolder(this.sidecarBackupPath);
+            await this.adapter.write(this.sidecarBackupPath, current);
+          }
         }
       }
-      await this.adapter.write(this.sidecarPath, out);
-      this.dirty = false;
+      // Serialize AFTER the merge so foreign annotations survive this write.
+      await this.adapter.write(this.sidecarPath, serializeAnnotations(this.doc, this.pdfBasename));
     } catch (error) {
       // Keep the in-memory document retryable after transient adapter/iCloud
       // failures instead of falsely treating an unsuccessful write as saved.
       this.dirty = true;
       throw error;
     }
+  }
+
+  /**
+   * Fold in annotations that appeared in the sidecar since we loaded it.
+   *
+   * A save rewrites the whole file, so anything another writer added would
+   * otherwise be deleted without a trace. That writer is not hypothetical: the
+   * same PDF open in two panes, or in both viewing modes, gets one store each,
+   * and a sync client can drop in a newer sidecar at any moment. Ours wins on
+   * conflicting ids, and ids WE deleted stay deleted.
+   */
+  private mergeForeignHighlights(diskHighlights: Highlight[]): void {
+    if (!Array.isArray(diskHighlights)) return;
+    const mine = new Set(this.doc.highlights.map((h) => h.id));
+    const added = diskHighlights.filter(
+      (h) => h && typeof h.id === "string" && !mine.has(h.id) && !this.removedIds.has(h.id)
+    );
+    if (!added.length) return;
+    this.doc.highlights.push(...added);
+    console.warn(
+      `[local-pdf-annotator] merged ${added.length} annotation(s) that another view or device ` +
+        `wrote to ${this.sidecarPath} while this one was open`
+    );
+    this.onChange?.();
   }
 
   private async ensureParentFolder(filePath: string): Promise<void> {

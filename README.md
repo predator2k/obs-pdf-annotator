@@ -9,36 +9,32 @@ write a note, and carry on reading without changing apps.
 
 ## Mark what matters
 
-Select some words and choose what you want to do:
+Select some words and a small popover appears: colors on the first row, mark
+styles on the second. **Clicking a color marks the words immediately** — one
+click, no confirmation step. The style row picks how the mark looks: plain
+highlight, underline, dotted underline, dashed underline, box, or
+strike-through. Your last style and color are remembered, so you set your pen
+once and keep reading.
 
-- **Highlight** marks the words.
-- **Annotate** marks the words and opens a note editor.
-- **Copy** copies the selected words.
-
-![Simple buttons for highlighting, annotating, or copying selected words](docs/screenshots/selection-popover-light-retina.png)
-
-Pick the mark style right in the popover: plain highlight, underline, dotted
-underline, dashed underline, box, or strike-through. Your last style and color
-are remembered — set your pen once and keep reading.
+The default palette is Zotero's eight reader colors (yellow, red, green, blue,
+purple, magenta, orange, gray), and you can change it in settings.
 
 Prefer zero clicks? **Arm a color in the toolbar** (click one of the swatches
 between the native controls): from then on, selecting text highlights it
-instantly with your current style — no popover. Click the armed swatch again
-to disarm and get the popover flow back.
+instantly with your current style — no popover at all. Click the armed swatch
+again to disarm and get the popover flow back.
 
 ## Notes live in a popup
 
 Notes come in two forms:
 
-- **Attached to a highlight** — choose **Annotate** after selecting text, or
-  click an existing mark and write in its popup.
+- **Attached to a mark** — click any existing mark and write in its popup.
 - **Free-form page notes** — click the tag button in the toolbar, then click
   anywhere on the page. The note is anchored to that exact position, no text
   selection needed.
 
-Click any mark or page note to open its editor. The popup shows the quoted
-words (for highlights), and lets you change the style, change the color, write
-a note, copy the text, copy a link, or delete it. Nothing moves on the page and
+The editor popup lets you change the style, change the color, write a note,
+copy the text, copy a link, or delete the mark. Nothing moves on the page and
 the zoom level never changes.
 
 On phones the same editor opens as a sheet, sized for thumbs.
@@ -63,13 +59,15 @@ exact position on the page.
 
 ## Find a note again
 
-- **In the PDF**: click the list button beside **Annotate** for a searchable
-  list of every mark and note. Click a result to jump to it.
-- **In the sidebar**: run **Open annotations panel** for a workspace panel that
-  always shows the highlights of the PDF you are reading, with search. It works
-  with both viewing modes and stays put while you write in other notes.
-
-![The searchable list of notes beside the PDF](docs/screenshots/annotation-list-light-retina.png)
+- **In the PDF's own sidebar**: open Obsidian's PDF sidebar and pick
+  **Annotations** from its options menu, alongside Thumbnails and Outline. You
+  get a searchable list of every mark and note; click one to select and reveal
+  it. (If that menu cannot be extended — an unexpected Obsidian version — a
+  standalone list button appears in the toolbar instead.)
+- **In the workspace sidebar**: run **Open annotations panel** for a panel that
+  always shows the annotations of the document you are reading, with search. It
+  works with all three viewing modes and stays put while you write in other
+  notes.
 
 ## Your own colors
 
@@ -105,10 +103,14 @@ mode adds annotation layers, controls, and an annotation list to Obsidian's
 native PDF viewer; the native toolbar, outline/sidebar, zoom, and page
 navigation remain in place and are never driven programmatically.
 
-Selection alone does not create an annotation. The selection popover commits a
-highlight or annotated mark only after you choose an action. Highlight geometry
-is stored in PDF user-space coordinates, so marks stay anchored across zoom and
-resize changes.
+Selection alone does not create an annotation unless you have armed a toolbar
+color; otherwise the popover commits the mark when you click a color. Highlight
+geometry is stored in PDF user-space coordinates, so marks stay anchored across
+zoom and resize changes.
+
+Marks follow the page's own appearance: when a theme or CSS snippet inverts the
+PDF canvas for dark reading, the plugin detects it and switches marks to a
+blend mode that stays legible on the inverted page.
 
 ### Native PDF workflow
 
@@ -174,6 +176,17 @@ native-viewer annotation mode is the mobile experience: select text with the
 system grabbers, then use the popover; tap a mark to edit it in a sheet.
 Tag dragging and hover previews are desktop-only.
 
+Because the system selection grabbers keep moving while you drag them, the
+popover waits for the selection to hold still before appearing, and it appears
+below the selection so iOS's own copy/paste callout does not sit on top of it.
+The wait is the **Selection popup delay on mobile** setting (0–5 s, default 3 s)
+— lower it if you select precisely, raise it if the popover keeps interrupting.
+
+On iPad, Obsidian's text layer can sit slightly offset from the rendered glyphs,
+which would place marks a few pixels off. Committed marks are therefore
+re-anchored through the plugin's own pdf.js so the painted mark lands on the
+glyphs you actually selected.
+
 ## Privacy
 
 PDF Annotator does not use telemetry and does not send PDF contents or
@@ -210,8 +223,10 @@ PDF Annotator.
 
 - **Toggle annotation mode on the native PDF view**
 - **Open annotations panel**
-- **Export annotations for current PDF** — snapshot under
-  `.pdf-annotate/Exports/`
+- **Export annotations for current PDF** — a readable snapshot under
+  `PDF exports/`, mirroring the PDF's own vault path. Exports live outside the
+  annotation folder so they are always indexed by Obsidian (the default
+  annotation folder is hidden) and can never be written over a live sidecar
 - **Delete stored PDF copies (reclaim space)** — removes 0.2.x-era duplicates
   (copies whose PDF no longer exists anywhere in the vault are kept, since they
   are the only surviving copy of that document)

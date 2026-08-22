@@ -92,7 +92,12 @@ export function findSelectionInChunks(
 
   // --- Pass 1: whole-string match, best disambiguated occurrence ---
   const best = findBestMatch(search, needle, nPrefix, nSuffix);
-  if (best) return spanToSubpath(chunks, map, best.start, best.end);
+  // A tie means the passage repeats on the page and the surrounding context did
+  // not separate the occurrences, so "the first one" is a coin flip. A link
+  // that silently points at the wrong words is worse than one that points at
+  // the page, which is the promise in this module's header.
+  if (best && !best.ambiguous) return spanToSubpath(chunks, map, best.start, best.end);
+  if (best) return null;
 
   // --- Pass 2: head + tail span fallback (handles internal drift) ---
   const fb = findDriftSpan(search, needle, nPrefix, nSuffix);

@@ -12,6 +12,8 @@ const tests = [
   { entry: "test/pdf-data-smoke.ts" },
   { entry: "test/bundle-identity-smoke.ts" },
   { entry: "test/pdf-link-smoke.ts" },
+  { entry: "test/sanitize-smoke.ts" },
+  { entry: "test/anchor-smoke.ts" },
   {
     entry: "test/annotation-format-smoke.ts",
     alias: { obsidian: path.join(root, "test/obsidian-stub.ts") },
