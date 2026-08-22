@@ -39,11 +39,30 @@ export class AnnotationHub extends Events {
   private sources = new Map<string, AnnotationSource>();
   private activeKey: string | null = null;
 
+  constructor(private app?: App) {
+    super();
+  }
+
+  /** The registered source whose leaf currently has focus, if any. */
+  private focusedSource(): AnnotationSource | null {
+    const leaf = this.app?.workspace.activeLeaf;
+    if (!leaf) return null;
+    for (const src of this.sources.values()) if (src.ownsLeaf(leaf)) return src;
+    return null;
+  }
+
   register(src: AnnotationSource): void {
     this.sources.set(src.key, src);
     src.store.onChange = () => this.trigger("annotations-changed", src);
-    // A freshly opened document becomes the active one.
-    this.activeKey = src.key;
+    // Become active only when this document is the one being looked at, or when
+    // nothing is active yet. On workspace restore several documents register in
+    // whatever order their async loads happen to finish, and unconditionally
+    // taking over would point the panel — and the Delete key that follows it —
+    // at whichever finished last.
+    const focused = this.app?.workspace.activeLeaf;
+    if ((focused && src.ownsLeaf(focused)) || !this.active) {
+      this.activeKey = src.key;
+    }
     this.trigger("active-changed");
   }
 
@@ -53,8 +72,10 @@ export class AnnotationHub extends Events {
     src.store.onChange = null;
     this.sources.delete(key);
     if (this.activeKey === key) {
+      const focused = this.focusedSource();
       const remaining = [...this.sources.keys()];
-      this.activeKey = remaining.length ? remaining[remaining.length - 1] : null;
+      this.activeKey =
+        focused?.key ?? (remaining.length ? remaining[remaining.length - 1] : null);
     }
     this.trigger("active-changed");
   }

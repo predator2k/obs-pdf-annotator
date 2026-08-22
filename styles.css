@@ -1901,11 +1901,20 @@
   min-height: 24px;
   padding: 1px 4px;
 }
-/* Tight toolbars (narrow panes): let the style row shrink away first. */
-@media (max-width: 900px) {
-  .pdf-toolbar .lpa-toolbar-styles {
-    display: none;
-  }
+/* Tight toolbars: let our controls scroll instead of overflowing.
+
+   This used to hide the style row below a 900px WINDOW, which measures the
+   wrong thing — three panes in a wide window each have a ~500px toolbar and
+   kept the row (so it clipped), while a narrow single-pane window lost the row
+   for no reason. Scrolling behaves correctly at every pane width, which is
+   what the mobile rules already do. */
+.pdf-toolbar .lpa-native-controls {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.pdf-toolbar .lpa-native-controls::-webkit-scrollbar {
+  display: none;
 }
 
 /* ---- Toolbar swatches: armed = ringed, unarmed = plain dot -------------- */

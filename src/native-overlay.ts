@@ -349,7 +349,12 @@ export class NativeOverlayManager {
       this.retryCount = 0;
       return;
     }
-    if (this.retryTimer !== null || this.retryCount >= 5) return;
+    // The budget is a backstop against spinning forever on a view that will
+    // never grow a toolbar, not a deadline for slow ones. A cold vault or a
+    // large PDF on mobile can take several seconds, and running out used to
+    // mean the swatches never appeared at all until an unrelated workspace
+    // event happened to re-enter refresh().
+    if (this.retryTimer !== null || this.retryCount >= 24) return;
     this.retryCount++;
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null;
@@ -1036,6 +1041,11 @@ export class NativePdfOverlay {
     if (this.destroyed || !this.contentRoot || !this.store) return;
     this.updateDarkPageState();
     const store = this.store;
+    // One pass over the annotations instead of a full scan per page: this runs
+    // on every native mutation batch, so `byPage()` per page made it
+    // O(pages x annotations) — hundreds of thousands of comparisons per frame
+    // while scrolling a long, heavily annotated document.
+    const annotatedPages = new Set(store.doc.highlights.map((h) => h.page));
     const pageEls = this.contentRoot.querySelectorAll<HTMLElement>(".page[data-page-number]");
     for (const pageEl of Array.from(pageEls)) {
       const num = Number(pageEl.getAttribute("data-page-number"));
@@ -1043,10 +1053,7 @@ export class NativePdfOverlay {
       const idx = num - 1;
       // Skip untouched placeholder pages so a 500-page PDF doesn't load
       // geometry for every page up front; selection capture loads on demand.
-      const active =
-        pageEl.hasAttribute("data-loaded") ||
-        !!pageEl.querySelector(":scope > .textLayer, :scope > .canvasWrapper, :scope > .lpa-native-hl-layer");
-      if (!active && store.byPage(idx).length === 0) continue;
+      if (!isRenderedPage(pageEl) && !annotatedPages.has(idx)) continue;
       void this.syncPage(idx, pageEl);
     }
     this.scheduleRailLayout();
@@ -1303,6 +1310,11 @@ export class NativePdfOverlay {
     for (const pageEl of Array.from(root.querySelectorAll<HTMLElement>(".page[data-page-number]"))) {
       const num = Number(pageEl.getAttribute("data-page-number"));
       if (!Number.isFinite(num) || num < 1) continue;
+      // pdf.js creates a .page div for EVERY page up front, so measuring them
+      // all means one forced layout per page of the document on every scroll
+      // frame. Only pages it has actually rendered can be on screen, and every
+      // caller here cares about on-screen pages.
+      if (!isRenderedPage(pageEl)) continue;
       const box = pageContentBox(pageEl);
       if (!box) continue;
       out.push({ idx: num - 1, pageEl, box });
@@ -2875,6 +2887,14 @@ function pageContentBox(pageEl: HTMLElement): DOMRect | null {
     pageEl;
   const box = ref.getBoundingClientRect();
   return box.width >= 2 && box.height >= 2 ? box : null;
+}
+
+/** Has pdf.js actually rendered this page (as opposed to reserving its box)? */
+function isRenderedPage(pageEl: HTMLElement): boolean {
+  return (
+    pageEl.hasAttribute("data-loaded") ||
+    !!pageEl.querySelector(":scope > .textLayer, :scope > .canvasWrapper, :scope > .lpa-native-hl-layer")
+  );
 }
 
 function aspectMatches(box: DOMRect, geom: PageGeom): boolean {

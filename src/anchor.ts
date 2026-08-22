@@ -60,7 +60,20 @@ export function normChar(c: string): string {
   // Drop hyphens/dashes: line-break hyphenation differs between pdf.js versions.
   if (c === "-" || c === "‐" || c === "‑" || c === "–" || c === "—" || c === "‒" || c === "―" || c === "−")
     return "";
-  return c.normalize("NFKC").toLowerCase();
+  // Fold accents away by decomposing and dropping the combining marks.
+  //
+  // Normalization here is necessarily PER CHARACTER (the index maps each
+  // normalized char back to a raw offset), and composition is inherently
+  // multi-character: NFKC on one code point can never join "e" + U+0301 into
+  // "é" or split the reverse. So a quote copied in one composition form simply
+  // never matched a text layer that used the other — which is every accented
+  // passage, depending on how the PDF was produced. Decomposing first makes
+  // both forms land on the same bare letter.
+  return c
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .normalize("NFKC")
+    .toLowerCase();
 }
 
 export function normStr(s: string): string {

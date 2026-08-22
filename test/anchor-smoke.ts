@@ -27,6 +27,21 @@ assert.ok(
   "text containing a bidi mark is locatable"
 );
 
+// --- composition forms must match each other -------------------------------
+// The same word can reach us precomposed (U+00E9) or decomposed (e + U+0301)
+// depending on how the PDF was produced and how the quote was copied.
+const precomposed = "café résumé";
+const decomposed = "café résumé";
+assert.equal(normStr(precomposed), normStr(decomposed), "both composition forms normalize alike");
+assert.ok(
+  findSelectionInChunks([decomposed], precomposed),
+  "a precomposed quote anchors in decomposed page text"
+);
+assert.ok(
+  findSelectionInChunks([precomposed], decomposed),
+  "a decomposed quote anchors in precomposed page text"
+);
+
 // --- empty needle must not hang the UI thread ------------------------------
 // "abcabc".indexOf("", 7) clamps to 6 instead of returning -1, which makes the
 // occurrence scan a fixed point.

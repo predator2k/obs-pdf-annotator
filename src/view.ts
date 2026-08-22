@@ -1192,7 +1192,15 @@ export class PdfAnnotatorView extends FileView {
     try { pv.textTask?.cancel(); } catch {}
     pv.renderTask = null;
     pv.textTask = null;
-    pv.canvas?.remove();
+    // Detaching the element is not enough: the backing store (up to ~25 MB per
+    // page at high DPI) lives until the canvas itself is collected. Zeroing the
+    // dimensions frees it immediately, which matters when scrolling a long
+    // document tears down hundreds of pages in one sitting.
+    if (pv.canvas) {
+      pv.canvas.width = 0;
+      pv.canvas.height = 0;
+      pv.canvas.remove();
+    }
     pv.canvas = null;
     pv.textLayerEl?.remove();
     pv.textLayerEl = null;

@@ -101,11 +101,12 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
   settings!: LpaSettings;
   nativeOverlays!: NativeOverlayManager;
   bundleManager!: PdfBundleManager;
-  annotationHub = new AnnotationHub();
+  annotationHub!: AnnotationHub;
   private replacingCorePdfView = false;
   private nativePdfRefreshRaf: number | null = null;
 
   async onload(): Promise<void> {
+    this.annotationHub = new AnnotationHub(this.app);
     await this.loadSettings();
     this.bundleManager = new PdfBundleManager(this.app);
 
