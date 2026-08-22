@@ -151,9 +151,19 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
         )
     );
     try {
-      this.registerExtensions(["html", "htm"], VIEW_TYPE_HTML_ANNOTATOR);
+      // One call per extension: registration stops at the first conflict, so a
+      // combined call that throws on "htm" would leave "html" registered
+      // WITHOUT its unregister-on-unload cleanup — after which disabling the
+      // plugin leaves .html files opening into a dead view type.
+      for (const ext of ["html", "htm"]) {
+        try {
+          this.registerExtensions([ext], VIEW_TYPE_HTML_ANNOTATOR);
+        } catch (e) {
+          console.warn(`${LOG_TAG} could not claim .${ext} (another plugin owns it)`, e);
+        }
+      }
     } catch (e) {
-      console.warn(`${LOG_TAG} could not claim .html (another plugin owns it)`, e);
+      console.warn(`${LOG_TAG} could not claim HTML extensions`, e);
     }
 
     this.nativeOverlays = new NativeOverlayManager(
@@ -287,6 +297,10 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("layout-change", () => this.scheduleNativePdfRefresh())
     );
+    // Accents and mark inks are computed per theme and baked into inline styles
+    // at paint time, so a light/dark switch (or a snippet reload) has to force a
+    // repaint — otherwise every open view keeps the previous theme's colors.
+    this.registerEvent(this.app.workspace.on("css-change", () => this.refreshAnnotationUi()));
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (!(file instanceof TFile)) return;
@@ -318,9 +332,12 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     }
     // Detach native overlays (removes injected DOM, observers, listeners) …
     this.nativeOverlays.disable();
-    // … tear down our views (cancels pdf.js tasks, destroys docs) …
-    this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR).forEach((leaf) => leaf.detach());
     // … then revoke the worker Blob URL.
+    //
+    // The views themselves are NOT detached: Obsidian tears down the leaves of
+    // a deregistered view type on its own, and detaching here would close the
+    // user's open PDF tabs — losing their layout and scroll position — every
+    // time the plugin is updated or toggled off and on.
     disposePdfEngine();
     console.log(`${LOG_TAG} unloaded.`);
   }
@@ -430,16 +447,29 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
   }
 
   applyPaletteFromSettings(): void {
-    const entries = this.settings.customPalette;
+    // data.json can be hand-edited, written by an older build, or damaged by a
+    // sync conflict. A throw here happens inside loadSettings, i.e. inside
+    // onload — which would leave the plugin half-constructed and make onunload
+    // throw as well — so every field is treated as untrusted.
+    const raw = this.settings.customPalette;
+    const entries = Array.isArray(raw) ? raw : [];
+    const valid = entries.filter(
+      (e): e is { name: string; fill: string; highlightAlpha?: number } =>
+        !!e && typeof e === "object" && typeof (e as any).fill === "string"
+    );
     setActivePalette(
-      (entries ?? []).map((e) => {
+      valid.map((e) => {
+        const name = typeof e.name === "string" ? e.name.trim() : "";
+        const alpha = typeof e.highlightAlpha === "number" ? e.highlightAlpha : undefined;
         // An untouched built-in color keeps its hand-tuned ink/emoji/alpha.
         const preset = DEFAULT_PALETTE.find((p) => p.fill === e.fill);
-        return preset
-          ? { ...preset, name: e.name.trim() || preset.name }
-          : derivePaletteEntry(e.name, e.fill, e.highlightAlpha);
+        return preset ? { ...preset, name: name || preset.name } : derivePaletteEntry(name, e.fill, alpha);
       })
     );
+    if (valid.length !== entries.length) {
+      console.warn(`${LOG_TAG} ignored ${entries.length - valid.length} malformed palette entries`);
+    }
+    this.settings.customPalette = valid;
   }
 
   pen(): PenState {
@@ -504,6 +534,13 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR)) {
       const view = leaf.view;
       if (view instanceof PdfAnnotatorView) view.refreshAnnotationUi();
+    }
+    // The HTML reader shares the palette and pen, so it has to repaint too —
+    // otherwise two open views disagree about what a color means until the
+    // file is closed and reopened.
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HTML_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof HtmlAnnotatorView) view.refreshAnnotationUi();
     }
     this.nativeOverlays.refreshUi();
   }

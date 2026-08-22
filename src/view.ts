@@ -1175,6 +1175,15 @@ export class PdfAnnotatorView extends FileView {
       this.teardownPageContent(pv);
     } finally {
       pv.rendering = false;
+      // A zoom (or reload) that landed mid-render bumped the epoch and tore
+      // this page down, and its synchronous re-render was refused right then
+      // because `rendering` was still true. Nothing else retries — the
+      // IntersectionObserver does not re-fire for a target that was already
+      // intersecting — so without this the page stays blank until it is
+      // scrolled out of the prefetch band and back.
+      if (epoch !== this.renderEpoch && this.pdfDoc && this.visible.has(pv.index)) {
+        void this.renderPageContent(pv);
+      }
     }
   }
 
@@ -1407,6 +1416,15 @@ export class PdfAnnotatorView extends FileView {
   private onMouseUp(evt: MouseEvent): void {
     if (!this.store) return;
     if (this.tagPlacementMode) return;
+    // Mobile capture flows solely through the debounced selectionchange
+    // handler, as in the other two views: firing here as well would pop the
+    // editor the instant the finger lifts from the long-press — on top of iOS's
+    // own callout, before the grabbers have been dragged — and then again after
+    // the configured delay.
+    if (Platform.isMobile) return;
+    // A right-click has already opened the context menu for this hit; letting
+    // the release also open the editor stacks a popover under the menu.
+    if ((evt as PointerEvent).button !== undefined && (evt as PointerEvent).button !== 0) return;
     const doc = this.pagesEl.ownerDocument;
     const sel = doc.getSelection();
     if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
@@ -1841,14 +1859,18 @@ export class PdfAnnotatorView extends FileView {
       this.app,
       file,
       h,
-      [
-        async () => {
-          if (!pdfDoc) return null;
-          const page = await pdfDoc.getPage(h.page + 1);
-          const tc = await page.getTextContent();
-          return tc.items.map((it: any) => (typeof it.str === "string" ? it.str : ""));
-        },
-      ],
+      // NO chunk source for quoted marks, deliberately.
+      //
+      // A `selection=` subpath addresses items by their index in the RENDERED
+      // text layer, and whoever opens the link resolves it with Obsidian's
+      // pdf.js — not the copy this view pins. Text-item segmentation changed
+      // across pdf.js majors, so indices harvested here can address different
+      // words there, and the citation would point at the wrong passage with no
+      // sign anything went wrong. The native overlay avoids this by reading
+      // Obsidian's own text layer; this view has no access to one, so it links
+      // to the page instead. Page notes below are unaffected: their subpath is
+      // a coordinate destination, which no engine difference can shift.
+      [],
       async () => {
         if (!pdfDoc) return null;
         const page = await pdfDoc.getPage(h.page + 1);
@@ -1979,9 +2001,12 @@ export class PdfAnnotatorView extends FileView {
       }
       this.scheduleMarginLayout();
     };
-    const up = (e: MouseEvent) => {
+    const detach = () => {
       doc.removeEventListener("mousemove", move, true);
       doc.removeEventListener("mouseup", up, true);
+    };
+    const up = (e: MouseEvent) => {
+      detach();
       const pageRect = pv.el.getBoundingClientRect();
       const xPct = clamp(0, ((e.clientX - pageRect.left) / Math.max(1, pageRect.width)) * 100, 100);
       const yPct = clamp(0, ((e.clientY - pageRect.top) / Math.max(1, pageRect.height)) * 100, 100);
@@ -1990,6 +2015,11 @@ export class PdfAnnotatorView extends FileView {
     };
     doc.addEventListener("mousemove", move, true);
     doc.addEventListener("mouseup", up, true);
+    // A drag can end without a mouseup we ever see (native drag, window switch,
+    // the view closing mid-drag). These are raw capture-phase document
+    // listeners, so without an owner they would stay attached for the session
+    // and later fire against a torn-down view.
+    this.register(detach);
   }
 
   private computeAnnotationAnchor(h: Highlight): AnnotationAnchor | null {

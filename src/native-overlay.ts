@@ -68,7 +68,7 @@ import {
   shortAnnotationText,
   tagPreview,
 } from "./annotation-format";
-import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, popoverEdgeInsets, selectionContext } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha } from "./color";
 import { mayHandleDocumentKeys, type AnnotationHub } from "./annotation-hub";
@@ -391,6 +391,10 @@ export class NativePdfOverlay {
   private toolbarSwatchesEl: HTMLElement | null = null;
   private fitWidthBtn: HTMLElement | null = null;
   private sidebarViewEl: HTMLElement | null = null;
+  /** Unsubscribes the ONE live `sidebarviewchanged` handler (see ensureSidebarTab). */
+  private sidebarBusOff: (() => void) | null = null;
+  /** Obsidian's sidebar content element, if WE gave it `position: relative`. */
+  private sidebarPositionPatched: HTMLElement | null = null;
   private sidebarActive = false;
   private sidebarMenuTriggerEl: HTMLElement | null = null;
   private suppressSidebarViewEvents = 0;
@@ -454,6 +458,10 @@ export class NativePdfOverlay {
     initPdfEngine();
     const container = this.leaf.view.containerEl;
     this.contentRoot = container.querySelector<HTMLElement>(".view-content") ?? container;
+    // Marks this leaf as ours, so the stylesheet can scope its rules to PDF
+    // views the plugin actually attached to instead of restyling every native
+    // PDF view in the app (including ones with annotation mode turned off).
+    this.contentRoot.addClass("lpa-native-host");
 
     // Geometry-only document via OUR bundled pdf.js (no rendering, no globals).
     const data = await this.app.vault.readBinary(this.file);
@@ -604,6 +612,7 @@ export class NativePdfOverlay {
     this.scroller = null;
 
     this.contentRoot?.removeClass("lpa-dark-pages");
+    this.contentRoot?.removeClass("lpa-native-host");
     this.contentRoot
       ?.querySelectorAll<HTMLElement>(
         ".lpa-native-hl-layer, .lpa-native-note-layer, .lpa-native-margins"
@@ -792,7 +801,11 @@ export class NativePdfOverlay {
     // container even when the native DOM leaves it statically positioned.
     const win = content.ownerDocument.defaultView ?? window;
     if (win.getComputedStyle(content).position === "static") {
+      // Obsidian's own element: remember that WE changed it so teardown can put
+      // it back, instead of leaving the sidebar's containing block altered for
+      // as long as the leaf lives.
       content.style.position = "relative";
+      this.sidebarPositionPatched = content;
     }
     const view = content.createDiv({ cls: "lpa-sidebar-annotations" });
     this.buildListBody(view, false);
@@ -800,6 +813,12 @@ export class NativePdfOverlay {
 
     const bus = v?.eventBus;
     if (bus?.on) {
+      // The tab is rebuilt whenever the toolbar group is recreated, and each
+      // rebuild used to add ANOTHER subscription while the old one stayed live.
+      // Two handlers then share one suppression counter: the first consumes it,
+      // the second sees zero and immediately switches the panel we just opened
+      // back off — leaving a list that looks active but never updates.
+      this.detachSidebarBus();
       const onViewChanged = () => {
         // Opening the sidebar ourselves ALSO fires this event (the native
         // viewer restores its remembered view) — only a real user choice of
@@ -812,7 +831,7 @@ export class NativePdfOverlay {
         if (this.sidebarActive) this.setSidebarAnnotationsActive(false);
       };
       bus.on("sidebarviewchanged", onViewChanged);
-      this.cleanups.push(() => bus.off?.("sidebarviewchanged", onViewChanged));
+      this.sidebarBusOff = () => bus.off?.("sidebarviewchanged", onViewChanged);
     }
     if (this.sidebarActive) this.setSidebarAnnotationsActive(true);
     return true;
@@ -925,9 +944,26 @@ export class NativePdfOverlay {
     this.countEl = null;
     this.fitWidthBtn?.remove();
     this.fitWidthBtn = null;
+    this.detachSidebarBus();
     this.sidebarViewEl?.remove();
     this.sidebarViewEl = null;
+    if (this.sidebarPositionPatched) {
+      this.sidebarPositionPatched.style.removeProperty("position");
+      this.sidebarPositionPatched = null;
+    }
     this.sidebarActive = false;
+    // The suppression counter belongs to the handler that just went away; a
+    // leftover count would swallow the next genuine user view change.
+    this.suppressSidebarViewEvents = 0;
+  }
+
+  private detachSidebarBus(): void {
+    try {
+      this.sidebarBusOff?.();
+    } catch {
+      /* the viewer may already be gone */
+    }
+    this.sidebarBusOff = null;
   }
 
   private syncToolbarState(): void {
@@ -1023,8 +1059,19 @@ export class NativePdfOverlay {
     const root = this.contentRoot;
     if (!root) return;
     const canvas = root.querySelector<HTMLElement>(".canvasWrapper canvas");
-    const filter = canvas ? (canvas.ownerDocument.defaultView ?? window).getComputedStyle(canvas).filter : "";
-    const inverted = filter.includes("invert");
+    // `filter` does not inherit, so reading it off the canvas alone misses the
+    // common case: snippets usually invert a CONTAINER (.pdf-viewer, .page).
+    // Walk up to the content root and treat an inversion anywhere on the chain
+    // as a dark page, or marks stay on multiply blending and turn to mud.
+    let inverted = false;
+    const win = root.ownerDocument.defaultView ?? window;
+    for (let el: HTMLElement | null = canvas ?? root; el; el = el.parentElement) {
+      if (win.getComputedStyle(el).filter.includes("invert")) {
+        inverted = true;
+        break;
+      }
+      if (el === root) break;
+    }
     if (inverted !== this.darkPages) {
       this.darkPages = inverted;
       root.toggleClass("lpa-dark-pages", inverted);
@@ -1094,7 +1141,7 @@ export class NativePdfOverlay {
     // A page shown at a different rotation than our geometry would misplace
     // every mark — skip painting rather than paint wrong.
     const box = pageContentBox(pageEl);
-    if (box && !aspectMatches(box, geom)) {
+    if (box && !this.pageMappable(box, geom)) {
       this.warnRotatedOnce();
       return;
     }
@@ -1277,7 +1324,7 @@ export class NativePdfOverlay {
     const hit = this.pageBoxAtPoint(x, y);
     if (!hit) return null;
     const geom = this.geoms.get(hit.idx);
-    if (!geom || !aspectMatches(hit.box, geom)) return null;
+    if (!geom || !this.pageMappable(hit.box, geom)) return null;
     const [px, py] = clientToPdfPoint(x, y, hit.box, geom);
     const matches = store.byPage(hit.idx).filter(
       (h) =>
@@ -1345,7 +1392,7 @@ export class NativePdfOverlay {
       const geom = await this.ensureGeom(idx);
       if (this.destroyed) return;
       if (!geom) continue;
-      if (!aspectMatches(entry.box, geom)) {
+      if (!this.pageMappable(entry.box, geom)) {
         rotated = true;
         continue;
       }
@@ -1483,9 +1530,40 @@ export class NativePdfOverlay {
     // Centered under the selection; the larger mobile drop keeps clear of the
     // iOS text-selection callout.
     const gap = Platform.isMobile ? 56 : 12;
-    const px = clamp(8, x - pr.width / 2, Math.max(8, vw - pr.width - 8));
-    const py = clamp(8, y + gap, Math.max(8, vh - pr.height - 8));
+    const { edge, bottom } = popoverEdgeInsets(doc);
+    const px = clamp(edge, x - pr.width / 2, Math.max(edge, vw - pr.width - edge));
+    const py = clamp(edge, y + gap, Math.max(edge, vh - pr.height - bottom));
     pop.setCssProps({ left: `${px}px`, top: `${py}px`, visibility: "visible" });
+  }
+
+  /** User-applied viewer rotation in degrees (0/90/180/270); 0 if unavailable. */
+  private viewerRotation(): number {
+    const raw = Number(this.nativeViewer()?.pdfViewer?.pagesRotation ?? 0);
+    return Number.isFinite(raw) ? ((raw % 360) + 360) % 360 : 0;
+  }
+
+  /**
+   * Can this page box be mapped to PDF space?
+   *
+   * Aspect ratio alone catches 90°/270°, but 180° preserves it EXACTLY — so a
+   * page rotated twice would pass, and every mark would be painted
+   * point-reflected while new selections were stored with mirrored
+   * coordinates, corrupting the sidecar. Ask the viewer for its rotation
+   * instead of inferring it, and decline to map anything while it is turned.
+   */
+  private pageMappable(box: DOMRect | null | undefined, geom: PageGeom | null | undefined): boolean {
+    if (!box || !geom) return false;
+    if (this.viewerRotation() !== 0) return false;
+    return aspectMatches(box, geom);
+  }
+
+  /** Does this selection start inside the plugin's own UI rather than the page? */
+  private selectionStartsInOwnUi(sel: Selection): boolean {
+    const node = sel.anchorNode;
+    const el = node?.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node?.parentElement;
+    return !!el?.closest(
+      ".lpa-selection-popover, .lpa-mark-popover, .lpa-native-controls, .lpa-native-roll, .lpa-native-margins, .lpa-sidebar-annotations"
+    );
   }
 
   private hideSelectionPopover(clearNativeSelection: boolean): void {
@@ -1515,6 +1593,11 @@ export class NativePdfOverlay {
         if (this.destroyed || !this.store || this.tagMode) return;
         const cur = this.contentRoot?.ownerDocument.getSelection();
         if (!cur || cur.isCollapsed || cur.toString().trim().length === 0) return;
+        // Same origin check the pointerup path applies: text selected inside
+        // our OWN panels (the annotations list, a popover) sits over the page,
+        // so without this a long-press to copy a list entry commits a phantom
+        // mark carrying the list's text at the panel's screen position.
+        if (this.selectionStartsInOwnUi(cur)) return;
         const rects = cur.rangeCount ? Array.from(cur.getRangeAt(cur.rangeCount - 1).getClientRects()) : [];
         const last = rects[rects.length - 1];
         if (!last) return;
@@ -1847,7 +1930,7 @@ export class NativePdfOverlay {
         }
         continue;
       }
-      if (!aspectMatches(b.box, geom)) continue;
+      if (!this.pageMappable(b.box, geom)) continue;
       pages.set(b.idx, { box: b.box, geom });
       pageLeft = Math.min(pageLeft, b.box.left);
       pageRight = Math.max(pageRight, b.box.right);
@@ -2393,7 +2476,7 @@ export class NativePdfOverlay {
     const idx = num - 1;
     const geom = this.geoms.get(idx);
     const box = pageContentBox(p.pageEl);
-    if (!geom || !box || !aspectMatches(box, geom)) return null;
+    if (!geom || !box || !this.pageMappable(box, geom)) return null;
     const [px, py] = clientToPdfPoint(p.x, p.y, box, geom);
     const matches = store.byPage(idx).filter(
       (h) =>

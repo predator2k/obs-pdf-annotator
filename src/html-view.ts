@@ -30,7 +30,7 @@ import {
 } from "./annotations";
 import { findBestMatch, normChar, normStr } from "./anchor";
 import { annotationTypeOf } from "./annotation-format";
-import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, popoverEdgeInsets, selectionContext } from "./annotation-popover";
 import { mayHandleDocumentKeys, type AnnotationHub } from "./annotation-hub";
 import { sanitizeDocument } from "./sanitize-html";
 
@@ -181,6 +181,15 @@ export class HtmlAnnotatorView extends FileView {
   }
 
   /** Same pen bar as the PDF toolbar: colors arm/disarm, styles set the pen. */
+  /** Rebuild palette-dependent UI and repaint marks after a settings change. */
+  refreshAnnotationUi(): void {
+    if (!this.toolbarEl) return;
+    // A removed palette entry must not stay armed.
+    if (!PALETTE.some((p) => p.fill === this.currentColor)) this.currentColor = defaultColor();
+    this.buildToolbar();
+    if (this.store) this.paintAll();
+  }
+
   private buildToolbar(): void {
     this.toolbarEl.empty();
 
@@ -593,8 +602,9 @@ export class HtmlAnnotatorView extends FileView {
     const vw = doc.documentElement.clientWidth;
     const vh = doc.documentElement.clientHeight;
     const gap = Platform.isMobile ? 56 : 12;
-    const px = Math.min(Math.max(8, x - pr.width / 2), Math.max(8, vw - pr.width - 8));
-    const py = Math.min(Math.max(8, y + gap), Math.max(8, vh - pr.height - 8));
+    const { edge, bottom } = popoverEdgeInsets(doc);
+    const px = Math.min(Math.max(edge, x - pr.width / 2), Math.max(edge, vw - pr.width - edge));
+    const py = Math.min(Math.max(edge, y + gap), Math.max(edge, vh - pr.height - bottom));
     pop.setCssProps({ left: `${px}px`, top: `${py}px`, visibility: "visible" });
   }
 

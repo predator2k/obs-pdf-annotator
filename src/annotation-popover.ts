@@ -45,7 +45,9 @@ export function bindPopoverAction(btn: HTMLElement, fn: (evt: Event) => void): v
   btn.addEventListener("pointerup", (evt) => {
     const pe = evt as PointerEvent;
     if (pe.pointerId !== pressId || pe.button !== 0) {
-      pressId = null;
+      // Do NOT clear here: this release belongs to a different pointer (a
+      // second finger, or the right button pressed during a left press).
+      // Clearing would discard the still-live press and swallow its activation.
       return;
     }
     pressId = null;
@@ -110,26 +112,87 @@ export function buildSelectionStyleRow(
   sync();
 }
 
+const CONTEXT_CHARS = 32;
+
+/**
+ * How much room to keep clear of the window edges when placing a popover.
+ *
+ * The layout viewport runs underneath Obsidian's mobile toolbar and the iOS
+ * home indicator, so a popover clamped to the raw viewport height has its
+ * bottom row of controls sitting behind them — visible but untappable.
+ */
+export function popoverEdgeInsets(doc: Document): { edge: number; bottom: number } {
+  const edge = 8;
+  if (!Platform.isMobile) return { edge, bottom: edge };
+  const raw = doc.defaultView
+    ?.getComputedStyle(doc.body)
+    .getPropertyValue("--safe-area-inset-bottom")
+    .trim();
+  const safe = Number.parseFloat(raw ?? "") || 0;
+  return { edge, bottom: edge + 48 + safe };
+}
+
+/**
+ * Walk text nodes away from `node` in document order, collecting up to
+ * `want` characters. `root` bounds the walk so it never leaves the document
+ * being annotated.
+ */
+function textAround(container: Node, offset: number, want: number, back: boolean): string {
+  const doc = container.ownerDocument;
+  const root = doc?.body;
+  if (!doc || !root) return "";
+
+  let start: Node = container;
+  let out = "";
+  if (container.nodeType === Node.TEXT_NODE) {
+    const text = container.textContent ?? "";
+    out = back ? text.slice(0, offset) : text.slice(offset);
+  } else {
+    // An ELEMENT boundary indexes CHILDREN, not characters. Anchor the walk at
+    // the child just outside the selection, so context can never pick up text
+    // from inside the selection itself.
+    const child = container.childNodes[back ? offset - 1 : offset];
+    if (child) {
+      start = child;
+      if (child.nodeType === Node.TEXT_NODE) out = child.textContent ?? "";
+    } else if (!back) {
+      // Ends at the container's end: the next text is past its whole subtree.
+      let last: Node = container;
+      while (last.lastChild) last = last.lastChild;
+      start = last;
+    }
+  }
+
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  walker.currentNode = start;
+  while (out.length < want) {
+    const next = back ? walker.previousNode() : walker.nextNode();
+    if (!next) break;
+    const text = next.textContent ?? "";
+    out = back ? text + out : out + text;
+  }
+  return back ? out.slice(-want) : out.slice(0, want);
+}
+
 /**
  * Nearby text on either side of a selection, for disambiguating repeated
- * passages when re-anchoring. Boundaries on ELEMENT containers (triple-click,
- * cross-block drags) have child-index offsets, not text offsets — those sides
- * yield no context rather than garbage that would poison the sidecar.
+ * passages when re-anchoring.
+ *
+ * The context must cross node and element boundaries. Reading only inside the
+ * boundary text node yields NOTHING for the most ordinary gestures — selecting
+ * a whole sentence, paragraph, or triple-clicking all start at offset 0 and end
+ * at a node's end — and a mark stored without context re-anchors onto the first
+ * occurrence of its text, which is the wrong one whenever the page repeats a
+ * phrase.
  */
 export function selectionContext(sel: Selection): { prefix?: string; suffix?: string } | undefined {
   try {
     const first = sel.getRangeAt(0);
     const last = sel.getRangeAt(sel.rangeCount - 1);
-    let prefix: string | undefined;
-    let suffix: string | undefined;
-    if (first.startContainer.nodeType === Node.TEXT_NODE) {
-      const t = first.startContainer.textContent ?? "";
-      prefix = t.slice(Math.max(0, first.startOffset - 32), first.startOffset) || undefined;
-    }
-    if (last.endContainer.nodeType === Node.TEXT_NODE) {
-      const t = last.endContainer.textContent ?? "";
-      suffix = t.slice(last.endOffset, last.endOffset + 32) || undefined;
-    }
+    const prefix =
+      textAround(first.startContainer, first.startOffset, CONTEXT_CHARS, true) || undefined;
+    const suffix =
+      textAround(last.endContainer, last.endOffset, CONTEXT_CHARS, false) || undefined;
     return prefix || suffix ? { prefix, suffix } : undefined;
   } catch {
     return undefined;
@@ -199,14 +262,21 @@ export function openAnnotationEditor(
   const vw = doc.documentElement.clientWidth;
   const vh = doc.documentElement.clientHeight;
   const pr = pop.getBoundingClientRect();
+  const { edge, bottom } = popoverEdgeInsets(doc);
   let px = x + 6;
   let py = y + 10;
-  if (px + pr.width > vw - 8) px = Math.max(8, vw - pr.width - 8);
-  if (py + pr.height > vh - 8) py = Math.max(8, y - pr.height - 10);
+  if (px + pr.width > vw - edge) px = Math.max(edge, vw - pr.width - edge);
+  if (py + pr.height > vh - bottom) py = Math.max(edge, y - pr.height - 10);
   pop.setCssProps({ left: `${px}px`, top: `${py}px`, visibility: "visible" });
 
-  // Defer so the opening click doesn't immediately dismiss it.
-  window.setTimeout(() => doc.addEventListener("pointerdown", onDocPointer, true), 0);
+  // Defer so the opening click doesn't immediately dismiss it. If the editor is
+  // already closed by then (a same-tick teardown), skip the registration
+  // entirely — close() has run and can no longer remove it, so the listener
+  // would stay on the document forever, holding the detached popover with it.
+  window.setTimeout(() => {
+    if (closed) return;
+    doc.addEventListener("pointerdown", onDocPointer, true);
+  }, 0);
   doc.addEventListener("keydown", onKey, true);
 
   return close;

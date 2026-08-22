@@ -134,8 +134,12 @@
   cursor: crosshair;
 }
 
-/* Tags sit above the native text layer; keep clicks working there. */
-.lpa-native-note-layer {
+/* Tags sit above the native text layer; keep clicks working there.
+   `.lpa-note-layer` later in this file sets z-index 3 at the same specificity,
+   and source order would win — so raise the specificity here to make this the
+   deliberate winner rather than relying on the element happening to be appended
+   last (which a native re-render can undo). */
+.lpa-note-layer.lpa-native-note-layer {
   z-index: 5;
 }
 .lpa-page-tag.lpa-flash {
@@ -218,8 +222,11 @@
   border-color: color-mix(in srgb, var(--interactive-accent) 55%, var(--background-modifier-border));
 }
 
-/* Annotation list panel inside the native view. */
-.workspace-leaf-content[data-type="pdf"] .view-content {
+/* Annotation list panel inside the native view. Scoped to leaves the overlay
+   actually attached to: an unscoped rule here would change the containing
+   block for every absolutely-positioned descendant in EVERY native PDF view,
+   including Obsidian's own and other plugins' overlays. */
+.workspace-leaf-content[data-type="pdf"] .view-content.lpa-native-host {
   position: relative;
 }
 .lpa-native-roll {
@@ -1722,6 +1729,13 @@
 .lpa-panel-item:hover {
   background: var(--background-modifier-hover);
 }
+/* The selected entry is what Delete removes while this panel has focus, so it
+   has to be unmistakable — not just a hover tint. */
+.lpa-panel-item.is-active {
+  background: var(--background-modifier-hover);
+  border-color: var(--lpa-accent, var(--interactive-accent));
+  box-shadow: 0 0 0 1px var(--lpa-accent, var(--interactive-accent));
+}
 .lpa-panel-item-head {
   display: flex;
   align-items: center;
@@ -2210,10 +2224,15 @@
 }
 /* Dark theme: saved pages carry light-theme inline colors (dark gray text)
    that turn unreadable on a dark page — normalize text to the theme color.
-   Links, code, and our own marks keep their styling. */
+   Links, code, and our own marks keep their styling.
+
+   Deliberately NOT applied inside pre/code, and not to bare spans: syntax
+   highlighting is built almost entirely from colored spans inside <pre>, and
+   flattening those with !important turns every code block in a saved article
+   monochrome with no way for a user snippet to restore it. */
 .theme-dark .lpa-html-body
   :where(p, div, section, article, li, td, th, h1, h2, h3, h4, h5, h6,
-    strong, em, b, i, u, blockquote, figcaption, span:not(.lpa-html-mark)) {
+    strong, em, b, i, u, blockquote, figcaption):not(pre *):not(code *) {
   color: var(--text-normal) !important;
   background-color: transparent !important;
 }

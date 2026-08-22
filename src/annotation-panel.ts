@@ -23,6 +23,8 @@ export class AnnotationPanelView extends ItemView {
   private searchEl!: HTMLInputElement;
   private listEl!: HTMLElement;
   private searchQuery = "";
+  /** The entry the user last clicked — the one Delete would remove. */
+  private selectedId: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, private hub: AnnotationHub) {
     super(leaf);
@@ -115,6 +117,10 @@ export class AnnotationPanelView extends ItemView {
       const accent = annotationAccent(annotationColor(h));
       const item = this.listEl.createDiv({ cls: "lpa-panel-item" });
       item.style.setProperty("--lpa-accent", accent);
+      // Clicking an entry selects that annotation in the document, and Delete
+      // with this panel focused removes the SELECTED one. Show which that is,
+      // or the key destroys something the user was never shown.
+      if (h.id === this.selectedId) item.addClass("is-active");
       const head = item.createDiv({ cls: "lpa-panel-item-head" });
       head.createSpan({ cls: "lpa-panel-dot", attr: { "aria-hidden": "true" } });
       head.createSpan({ cls: "lpa-panel-page", text: `p.${h.page + 1}` });
@@ -123,7 +129,13 @@ export class AnnotationPanelView extends ItemView {
       const secondary = rollSecondaryText(h);
       if (secondary) item.createDiv({ cls: "lpa-panel-source", text: secondary });
 
-      item.onclick = () => void src.reveal(h.id);
+      item.onclick = () => {
+        this.selectedId = h.id;
+        for (const el of Array.from(this.listEl.children) as HTMLElement[]) {
+          el.toggleClass("is-active", el === item);
+        }
+        void src.reveal(h.id);
+      };
       item.addEventListener("contextmenu", (evt) => this.openItemMenu(evt, src, h.id));
     }
   }

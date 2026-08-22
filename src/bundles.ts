@@ -325,10 +325,15 @@ export class PdfBundleManager {
       const stat = await adapter.stat(copyPath);
       if (stat?.type !== "file") continue;
       const manifest = await this.readManifest(normalizePath(`${folder}/manifest.json`));
-      const knownPaths = uniquePaths([manifest?.currentPath, ...(manifest?.aliases ?? [])]);
+      // Only the document's CURRENT path proves it still exists. A historical
+      // alias can have been reused by an unrelated file since, and it is this
+      // check that decides whether we delete what may be the last copy of the
+      // document — the command's own confirmation promises orphans are kept.
+      const knownPaths = uniquePaths([manifest?.currentPath]);
       let workingCopyExists = false;
       for (const path of knownPaths) {
-        if (await adapter.exists(path)) {
+        // exists() is true for folders too; require an actual file.
+        if ((await adapter.stat(path))?.type === "file") {
           workingCopyExists = true;
           break;
         }
