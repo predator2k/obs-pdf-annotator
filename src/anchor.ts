@@ -60,20 +60,27 @@ export function normChar(c: string): string {
   // Drop hyphens/dashes: line-break hyphenation differs between pdf.js versions.
   if (c === "-" || c === "‐" || c === "‑" || c === "–" || c === "—" || c === "‒" || c === "―" || c === "−")
     return "";
-  // Fold accents away by decomposing and dropping the combining marks.
+  // DECOMPOSE (NFKD), never compose, and KEEP the marks.
   //
-  // Normalization here is necessarily PER CHARACTER (the index maps each
-  // normalized char back to a raw offset), and composition is inherently
-  // multi-character: NFKC on one code point can never join "e" + U+0301 into
-  // "é" or split the reverse. So a quote copied in one composition form simply
-  // never matched a text layer that used the other — which is every accented
-  // passage, depending on how the PDF was produced. Decomposing first makes
-  // both forms land on the same bare letter.
-  return c
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .normalize("NFKC")
-    .toLowerCase();
+  // Normalization here is necessarily PER CHARACTER — the index maps each
+  // normalized char back to a raw offset — and composition is inherently
+  // multi-character: no per-char rule can join "e" + U+0301 into "é". So a
+  // quote copied in one composition form never matched a text layer using the
+  // other. Decomposition is the direction that DOES work per character:
+  // precomposed "é" expands to "e" + U+0301, already-decomposed input stays as
+  // it is, and the two sides meet. It generalizes beyond Latin — Japanese
+  // dakuten and Hangul jamo decompose the same way — and the K also folds
+  // ligatures ("ﬁ" -> "fi").
+  //
+  // Marks are kept deliberately. Stripping them matches more sloppy text, but
+  // it merges genuinely different words — Vietnamese tồi/tôi, Russian мой/мои,
+  // French cote/côte — trading "fails to anchor" for "anchors on the WRONG
+  // words", which is the worse failure.
+  //
+  // The second NFKD re-decomposes anything lowercasing recomposed, and NFKD
+  // can emit spaces (U+00B4 -> space + combining acute) into a string that is
+  // documented whitespace-free, so strip those from the result.
+  return c.normalize("NFKD").toLowerCase().normalize("NFKD").replace(/\s/g, "");
 }
 
 export function normStr(s: string): string {
@@ -193,19 +200,42 @@ function resultsFromSpan(doc: DocIndex, gStart: number, gEnd: number): AnchorRes
   return out;
 }
 
+/** How much stored context to weigh. Matches what selectionContext captures. */
+const CONTEXT_WINDOW = 32;
+
+function commonSuffixLen(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[a.length - 1 - n] === b[b.length - 1 - n]) n++;
+  return n;
+}
+
+function commonPrefixLen(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[n] === b[n]) n++;
+  return n;
+}
+
+/**
+ * How well the text around a candidate occurrence matches the context recorded
+ * when the mark was made. The score is the NUMBER OF CONTEXT CHARACTERS that
+ * line up, so a candidate agreeing on 25 characters outranks one agreeing on 12.
+ *
+ * The previous version compared only the innermost 12 characters and scored a
+ * flat 2. That threw away most of the 32 characters actually stored, and any
+ * two occurrences sharing a short tail (", section two, ") tied — which then
+ * read as "ambiguous" or, worse, picked whichever came first.
+ */
 export function contextScore(search: string, start: number, end: number, nPrefix?: string, nSuffix?: string): number {
   let score = 0;
   if (nPrefix) {
-    const tail = nPrefix.slice(-12);
+    const tail = nPrefix.slice(-CONTEXT_WINDOW);
     const before = search.slice(Math.max(0, start - tail.length), start);
-    if (tail && before.endsWith(tail)) score += 2;
-    else if (tail.length >= 4 && before.slice(-4) === tail.slice(-4)) score += 1;
+    score += commonSuffixLen(tail, before);
   }
   if (nSuffix) {
-    const head = nSuffix.slice(0, 12);
+    const head = nSuffix.slice(0, CONTEXT_WINDOW);
     const after = search.slice(end + 1, end + 1 + head.length);
-    if (head && after.startsWith(head)) score += 2;
-    else if (head.length >= 4 && after.slice(0, 4) === head.slice(0, 4)) score += 1;
+    score += commonPrefixLen(head, after);
   }
   return score;
 }
@@ -243,7 +273,11 @@ export function findBestMatch(
     } else if (score === best.score) {
       ties++;
     }
-    if (best.score >= 4) break;
+    // NO early exit on a "good enough" score: stopping at the first strong
+    // match cannot know whether a later occurrence scores the same, and that
+    // is exactly what `ambiguous` has to report. Quitting early made the
+    // ambiguity guard silently useless for the case it exists for — two
+    // occurrences with equally matching context.
     from = at + 1;
   }
   return best ? { start: best.start, end: best.end, ambiguous: ties > 1 } : null;
@@ -265,14 +299,22 @@ export function findDriftSpan(
   if (needle.length < hlen) return null;
   const head = needle.slice(0, hlen);
   const tail = needle.slice(-hlen);
-  // This fallback exists for MINOR internal drift (ligatures, hyphenation),
-  // which normalization already collapses to a few characters either way. A
-  // generous window instead lets a head matched early pair with a tail matched
-  // much later, and the accepted span then swallows whole sentences the user
-  // never selected — silently, since the caller is told this is a confident
-  // match. Keep the window tight enough that only real drift fits.
+  // The span may exceed the quote by a FIXED allowance, not a percentage.
+  //
+  // What actually lands between a matched head and tail is page furniture: a
+  // running header and folio sitting in the concatenated document string where
+  // a quote crosses a page boundary — which is the case this module exists to
+  // handle. That interstitial is roughly constant (tens of characters), so a
+  // ratio is the wrong shape: 1.2x is generous for a long quote and far too
+  // tight for a short one, and it rejected ordinary cross-page selections.
+  //
+  // A fixed allowance still refuses the failure this guard is for — a head and
+  // tail matched paragraphs apart, swallowing sentences the user never
+  // selected. Note the drift this fallback was named for is length-neutral
+  // after normalization (ligatures, hyphens, curly quotes all collapse on both
+  // sides), so the allowance is spent entirely on inserted material.
   const lo = needle.length * 0.8;
-  const hi = needle.length * 1.2;
+  const hi = needle.length + 48;
   let fb: { start: number; end: number; score: number } | null = null;
   let from = 0;
   for (;;) {

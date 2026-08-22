@@ -403,6 +403,22 @@ export async function ensureFolderForFile(adapter: DataAdapter, filePath: string
  * destination is never overwritten — the old sidecar stays as a recovery
  * snapshot and a warning is logged.
  */
+/**
+ * Do these two paths name one file? True when the destination does not exist
+ * (nothing to collide with) or both stats agree — which is what a case-only
+ * difference looks like on a case-insensitive filesystem.
+ */
+async function isSameFile(adapter: DataAdapter, a: string, b: string): Promise<boolean> {
+  try {
+    const [sa, sb] = await Promise.all([adapter.stat(a), adapter.stat(b)]);
+    if (!sb) return true;
+    if (!sa) return false;
+    return sa.size === sb.size && sa.mtime === sb.mtime;
+  } catch {
+    return false;
+  }
+}
+
 export async function moveSidecarsForRename(
   adapter: DataAdapter,
   oldPdfPath: string,
@@ -414,10 +430,17 @@ export async function moveSidecarsForRename(
   if (from.annotationPath === to.annotationPath) return;
 
   // A case-only change is the SAME file on macOS/Windows. Treating it as a move
-  // would set the live sidecar aside as a "conflict" and delete its backup, so
-  // leave both alone: the existing file already answers to the new path there,
-  // and on a case-sensitive filesystem the move loop below still runs.
-  if (from.annotationPath.toLowerCase() === to.annotationPath.toLowerCase()) {
+  // would set the live sidecar aside as a "conflict" and delete its backup.
+  //
+  // But "same spelling, different case" does NOT imply one file: on a
+  // case-sensitive filesystem the destination can be a real, different
+  // document. Only take this branch once the two paths are confirmed to be the
+  // same file (or the destination is free); otherwise fall through to the
+  // conflict handling below, which preserves whatever is there.
+  if (
+    from.annotationPath.toLowerCase() === to.annotationPath.toLowerCase() &&
+    (await isSameFile(adapter, from.annotationPath, to.annotationPath))
+  ) {
     for (const [src, dst] of [
       [from.annotationPath, to.annotationPath],
       [from.backupPath, to.backupPath],
@@ -465,9 +488,19 @@ export async function moveSidecarsForRename(
         );
       }
     } else if ((await adapter.exists(from.backupPath)) && (await adapter.exists(to.backupPath))) {
-      // No sidecar at the destination, so this stray backup has nothing to
-      // recover; the incoming rolling backup wins.
-      await adapter.remove(to.backupPath);
+      // A backup with no sidecar beside it is the LAST surviving copy of that
+      // document (a partial sync, a manual delete). Deleting it to make room
+      // was silent, unrecoverable data loss; set it aside like a sidecar.
+      await adapter.rename(
+        to.backupPath,
+        to.backupPath.replace(
+          /\.annotations\.previous\.md$/,
+          `.annotations.conflict-${stamp}.previous.md`
+        )
+      );
+      console.warn(
+        `[local-pdf-annotator] preserved an orphaned rolling backup at ${to.backupPath}`
+      );
     }
   } catch (e) {
     console.error("[local-pdf-annotator] failed to set aside conflicting sidecar", e);
@@ -534,6 +567,21 @@ export function serializeAnnotations(doc: AnnotationDoc, pdfBasename: string): s
   return lines.join("\n");
 }
 
+/** Keep only entries that are actually usable annotations. */
+function sanitizeHighlights(highlights: unknown, path: string): Highlight[] {
+  if (!Array.isArray(highlights)) return [];
+  const kept = highlights.filter(
+    (h): h is Highlight =>
+      !!h && typeof h === "object" && typeof (h as Highlight).id === "string"
+  );
+  if (kept.length !== highlights.length) {
+    console.warn(
+      `[local-pdf-annotator] dropped ${highlights.length - kept.length} malformed annotation(s) from ${path}`
+    );
+  }
+  return kept;
+}
+
 /**
  * Extract the annotation document from a sidecar's ```json fenced block.
  * Tolerant of missing/garbled files.
@@ -554,6 +602,12 @@ export function parseAnnotations(content: string): AnnotationDoc | null {
     try {
       const parsed = JSON.parse(blocks[i]);
       if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.highlights)) continue;
+      // Require a marker only OUR serializer writes. A `highlights` array alone
+      // is too weak a signature: a user pasting `{"highlights": []}` into their
+      // notes below the managed block would otherwise be read as an empty
+      // document, and the next save would write that emptiness over their real
+      // annotations.
+      if (typeof parsed.version !== "number" && typeof parsed.pdf !== "string") continue;
       return parsed as AnnotationDoc;
     } catch {
       /* not our block — keep looking further up the file */
@@ -609,7 +663,12 @@ export class AnnotationStore {
             "keeping it attached (path identity tolerates content edits)."
         );
       }
-      this.doc.highlights = parsed.highlights;
+      // The sidecar header invites prose edits, so the array can come back with
+      // junk in it. One malformed entry would otherwise throw on every
+      // subsequent save (the merge maps over `h.id`), and because the debounced
+      // save discards its rejection the user would annotate for an hour and
+      // lose all of it on close, with nothing shown.
+      this.doc.highlights = sanitizeHighlights(parsed.highlights, path);
       // Adopt the stored fingerprint ONLY when the live document's is unknown.
       // Overwriting a known-live fingerprint with the stored one would make the
       // sidecar permanently misreport its document after any content edit, and
@@ -715,7 +774,7 @@ export class AnnotationStore {
         // Never replace the last-known-good recovery copy with a corrupt or
         // partially-written canonical sidecar.
         if (parsed) {
-          this.mergeForeignHighlights(parsed.highlights);
+          this.mergeForeignHighlights(parsed);
           if (this.sidecarBackupPath) {
             await this.ensureParentFolder(this.sidecarBackupPath);
             await this.adapter.write(this.sidecarBackupPath, current);
@@ -741,10 +800,26 @@ export class AnnotationStore {
    * and a sync client can drop in a newer sidecar at any moment. Ours wins on
    * conflicting ids, and ids WE deleted stay deleted.
    */
-  private mergeForeignHighlights(diskHighlights: Highlight[]): void {
-    if (!Array.isArray(diskHighlights)) return;
+  private mergeForeignHighlights(disk: AnnotationDoc): void {
+    if (!Array.isArray(disk.highlights)) return;
+    // ONLY merge with the same document. Without this gate, a store repointed
+    // at another document's sidecar — which happens when a rename cannot clear
+    // an occupied destination and the move is skipped — would union the two
+    // documents' annotations into one file and erase the other's identity.
+    // Either identifier agreeing is enough: the fingerprint changes when the
+    // PDF's bytes are edited, and the path changes when it is moved.
+    const sameDoc =
+      (!!disk.fingerprint && disk.fingerprint === this.doc.fingerprint) ||
+      (!!disk.pdf && disk.pdf === this.doc.pdf);
+    if (!sameDoc) {
+      console.warn(
+        `[local-pdf-annotator] ${this.sidecarPath} belongs to another document ` +
+          `(${disk.pdf ?? "unknown"}); not merging it into ${this.doc.pdf}`
+      );
+      return;
+    }
     const mine = new Set(this.doc.highlights.map((h) => h.id));
-    const added = diskHighlights.filter(
+    const added = disk.highlights.filter(
       (h) => h && typeof h.id === "string" && !mine.has(h.id) && !this.removedIds.has(h.id)
     );
     if (!added.length) return;

@@ -59,6 +59,8 @@ export class HtmlAnnotatorView extends FileView {
   private editorClose: (() => void) | null = null;
   private activeId: string | null = null;
   private mobileSelectionTimer: number | null = null;
+  /** Bumped on every load so a superseded one cannot finish over the new file. */
+  private loadToken = 0;
   private readonly hubKey = `html-${newId()}`;
 
   constructor(
@@ -115,14 +117,23 @@ export class HtmlAnnotatorView extends FileView {
     this.teardown();
   }
 
+  /** Release resources without closing the tab — see the PDF view's copy. */
+  releaseForPluginUnload(): void {
+    this.hub?.unregister(this.hubKey);
+    this.teardown();
+  }
+
   async onLoadFile(file: TFile): Promise<void> {
     this.teardown();
-    const raw = await this.app.vault.read(file);
     // Obsidian can start loading another file before this one settles; without
-    // the guard the render, the store, and the hub registration can end up
+    // a guard the render, the store, and the hub registration can end up
     // describing three different documents — and the rename path would then
-    // flush one document's annotations into another's sidecar.
-    if (this.file !== file) return;
+    // flush one document's annotations into another's sidecar. A monotonic
+    // token is the same mechanism the PDF view uses, and unlike comparing
+    // `this.file` it does not depend on when Obsidian assigns that field.
+    const token = ++this.loadToken;
+    const raw = await this.app.vault.read(file);
+    if (token !== this.loadToken) return;
     this.renderHtml(raw, file);
 
     const options = this.getAnnotationPathOptions();
@@ -141,7 +152,7 @@ export class HtmlAnnotatorView extends FileView {
       paths.backupPath
     );
     await this.store.load();
-    if (this.file !== file) return;
+    if (token !== this.loadToken) return;
     this.paintAll();
 
     if (this.hub && this.store) {
@@ -151,6 +162,7 @@ export class HtmlAnnotatorView extends FileView {
         file,
         store,
         reveal: (id) => this.revealAnnotation(id),
+        activeId: () => this.activeId,
         remove: (id) => this.deleteAnnotation(id),
         copyLink: (id) => this.copyAnnotationLink(id),
         ownsLeaf: (leaf) => leaf === this.leaf,
@@ -181,13 +193,23 @@ export class HtmlAnnotatorView extends FileView {
   }
 
   /** Same pen bar as the PDF toolbar: colors arm/disarm, styles set the pen. */
-  /** Rebuild palette-dependent UI and repaint marks after a settings change. */
+  /**
+   * Rebuild palette-dependent UI after a settings change.
+   *
+   * Colors are re-applied to the existing mark spans IN PLACE. A full repaint
+   * would unwrap every mark and `normalize()` the article, which merges the
+   * text nodes the live Selection points at — collapsing the user's selection
+   * and dismissing the popover they were about to click. That matters because
+   * this also runs on theme changes, which fire on every snippet save and on
+   * each step of the font-size slider. Re-anchoring is not needed anyway: the
+   * document text has not changed, only its colors.
+   */
   refreshAnnotationUi(): void {
     if (!this.toolbarEl) return;
     // A removed palette entry must not stay armed.
     if (!PALETTE.some((p) => p.fill === this.currentColor)) this.currentColor = defaultColor();
     this.buildToolbar();
-    if (this.store) this.paintAll();
+    for (const h of this.store?.doc.highlights ?? []) this.refreshMarkAppearance(h.id);
   }
 
   private buildToolbar(): void {
@@ -509,7 +531,7 @@ export class HtmlAnnotatorView extends FileView {
     if (!this.selectionInsideBody(sel)) return;
     const text = sel.toString().trim();
     if (!text) return;
-    this.pendingSelection = { text, context: selectionContext(sel) };
+    this.pendingSelection = { text, context: selectionContext(sel, this.bodyEl) };
 
     const rects = sel.rangeCount
       ? Array.from(sel.getRangeAt(sel.rangeCount - 1).getClientRects())

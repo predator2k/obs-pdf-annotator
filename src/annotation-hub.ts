@@ -30,6 +30,9 @@ export interface AnnotationSource {
   file: TFile;
   store: AnnotationStore;
   reveal(id: string): void | Promise<void>;
+  /** The annotation this source currently considers selected — the one the
+   * Delete key would remove. The panel highlights it so the two agree. */
+  activeId?(): string | null;
   remove(id: string): void;
   copyLink?(id: string): void | Promise<void>;
   ownsLeaf(leaf: WorkspaceLeaf): boolean;

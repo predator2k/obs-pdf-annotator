@@ -137,10 +137,15 @@ export function popoverEdgeInsets(doc: Document): { edge: number; bottom: number
  * `want` characters. `root` bounds the walk so it never leaves the document
  * being annotated.
  */
-function textAround(container: Node, offset: number, want: number, back: boolean): string {
+function textAround(
+  container: Node,
+  offset: number,
+  want: number,
+  back: boolean,
+  root: HTMLElement
+): string {
   const doc = container.ownerDocument;
-  const root = doc?.body;
-  if (!doc || !root) return "";
+  if (!doc || !root.contains(container)) return "";
 
   let start: Node = container;
   let out = "";
@@ -152,9 +157,20 @@ function textAround(container: Node, offset: number, want: number, back: boolean
     // the child just outside the selection, so context can never pick up text
     // from inside the selection itself.
     const child = container.childNodes[back ? offset - 1 : offset];
-    if (child) {
+    if (child && child.nodeType === Node.TEXT_NODE) {
       start = child;
-      if (child.nodeType === Node.TEXT_NODE) out = child.textContent ?? "";
+      out = child.textContent ?? "";
+    } else if (child && back) {
+      // Going backwards, the nearest text is the LAST text inside that
+      // preceding sibling. previousNode() would skip the subtree entirely — it
+      // steps to the sibling before it — so the context would silently omit
+      // the words directly against the quote, which is most of its value.
+      let last: Node = child;
+      while (last.lastChild) last = last.lastChild;
+      start = last;
+      out = last.nodeType === Node.TEXT_NODE ? (last.textContent ?? "") : "";
+    } else if (child) {
+      start = child;
     } else if (!back) {
       // Ends at the container's end: the next text is past its whole subtree.
       let last: Node = container;
@@ -163,6 +179,10 @@ function textAround(container: Node, offset: number, want: number, back: boolean
     }
   }
 
+  // Bounded by the annotated document, NOT doc.body: the article renders inside
+  // the live workspace, so walking to the body would scoop up the sidebar, the
+  // status bar and neighbouring panes — and persist that into the sidecar as
+  // "context" that can never be reproduced on the next open.
   const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   walker.currentNode = start;
   while (out.length < want) {
@@ -185,14 +205,24 @@ function textAround(container: Node, offset: number, want: number, back: boolean
  * occurrence of its text, which is the wrong one whenever the page repeats a
  * phrase.
  */
-export function selectionContext(sel: Selection): { prefix?: string; suffix?: string } | undefined {
+export function selectionContext(
+  sel: Selection,
+  root?: HTMLElement | null
+): { prefix?: string; suffix?: string } | undefined {
   try {
     const first = sel.getRangeAt(0);
     const last = sel.getRangeAt(sel.rangeCount - 1);
+    const bound =
+      root ??
+      ((first.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (first.startContainer as HTMLElement)
+        : first.startContainer.parentElement
+      )?.ownerDocument?.body ?? null);
+    if (!bound) return undefined;
     const prefix =
-      textAround(first.startContainer, first.startOffset, CONTEXT_CHARS, true) || undefined;
+      textAround(first.startContainer, first.startOffset, CONTEXT_CHARS, true, bound) || undefined;
     const suffix =
-      textAround(last.endContainer, last.endOffset, CONTEXT_CHARS, false) || undefined;
+      textAround(last.endContainer, last.endOffset, CONTEXT_CHARS, false, bound) || undefined;
     return prefix || suffix ? { prefix, suffix } : undefined;
   } catch {
     return undefined;

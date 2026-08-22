@@ -167,13 +167,37 @@ export class PdfBundleManager {
     const { annotationPath, backupPath } = pathModeSidecarPaths(file.path, options);
 
     const fallbacks: string[] = [];
-    // Same fingerprint gate as every candidate: a different document now at
-    // this path must never inherit the previous occupant's rolling backup.
-    if (await this.annotationCandidateMatches(backupPath, fingerprint)) {
+
+    // Is the canonical sidecar there, and is it readable? This decides how much
+    // the rolling backup has to be trusted, and whether a vault-wide rescue is
+    // worth its cost at all.
+    const canonicalState = await this.sidecarState(annotationPath);
+
+    // The rolling backup is THIS document's own previous serialization.
+    //
+    // Fingerprint-gating it alone was wrong: path identity explicitly tolerates
+    // edits to the PDF's bytes, and after any such edit the live fingerprint no
+    // longer matches what the backup recorded — so the one case the backup
+    // exists for, a corrupt canonical sidecar, was exactly when it got refused.
+    // Accept it when the fingerprint agrees, and also when the canonical file
+    // is present but unparseable, which is unambiguous corruption. Still refuse
+    // it when the canonical is simply ABSENT and the fingerprint disagrees:
+    // that is a different document newly placed at this path, and inheriting
+    // the previous occupant's annotations is the failure this gate is for.
+    if (
+      canonicalState === "corrupt" ||
+      (await this.annotationCandidateMatches(backupPath, fingerprint))
+    ) {
       fallbacks.push(backupPath);
     }
     fallbacks.push(
-      ...(await this.legacyAnnotationCandidates(file.path, fingerprint, options, annotationPath))
+      ...(await this.legacyAnnotationCandidates(
+        file.path,
+        fingerprint,
+        options,
+        annotationPath,
+        canonicalState === "missing"
+      ))
     );
     // The pre-upgrade folder's rolling backup is a recovery source too: a
     // corrupt legacy sidecar must still restore from its own .previous. Same
@@ -228,6 +252,16 @@ export class PdfBundleManager {
       migrateFallback: true,
       annotationBackupPath: backupPath,
     };
+  }
+
+  /** Is the canonical sidecar absent, present-and-readable, or present-and-broken? */
+  private async sidecarState(path: string): Promise<"missing" | "ok" | "corrupt"> {
+    try {
+      if ((await this.app.vault.adapter.stat(path))?.type !== "file") return "missing";
+      return parseAnnotations(await this.app.vault.adapter.read(path)) ? "ok" : "corrupt";
+    } catch {
+      return "corrupt";
+    }
   }
 
   /** Session memo: skip rehashing an unchanged file on repeat opens. */
@@ -329,14 +363,25 @@ export class PdfBundleManager {
       // alias can have been reused by an unrelated file since, and it is this
       // check that decides whether we delete what may be the last copy of the
       // document — the command's own confirmation promises orphans are kept.
-      const knownPaths = uniquePaths([manifest?.currentPath]);
+      // A path is only proof the document still exists if the file SITTING
+      // there is still that document. Paths get reused — the original is
+      // deleted and something else takes its name — and this check is what
+      // decides whether we delete what may be its last surviving bytes, which
+      // the command's confirmation promises not to do. Compare recorded size
+      // when we have it, and require a real file (exists() is true for folders).
       let workingCopyExists = false;
-      for (const path of knownPaths) {
-        // exists() is true for folders too; require an actual file.
-        if ((await adapter.stat(path))?.type === "file") {
-          workingCopyExists = true;
-          break;
-        }
+      for (const path of uniquePaths([manifest?.currentPath])) {
+        const stat = await adapter.stat(path);
+        if (stat?.type !== "file") continue;
+        if (typeof manifest?.byteLength === "number" && stat.size !== manifest.byteLength) continue;
+        workingCopyExists = true;
+        break;
+      }
+      // No manifest at all means no way to prove anything about this copy;
+      // keeping it is the choice that cannot destroy data.
+      if (!manifest) {
+        result.keptOrphans++;
+        continue;
       }
       if (!workingCopyExists) {
         result.keptOrphans++;
@@ -478,7 +523,8 @@ export class PdfBundleManager {
       file.path,
       fingerprint,
       legacyPathOptions,
-      paths.annotationPath
+      paths.annotationPath,
+      (await this.sidecarState(paths.annotationPath)) === "missing"
     );
     const annotationRecoveryPaths = (await this.app.vault.adapter.exists(paths.annotationBackupPath))
       ? [paths.annotationBackupPath]
@@ -520,7 +566,8 @@ export class PdfBundleManager {
     pdfPath: string,
     fingerprint: string | undefined,
     options: AnnotationPathOptions,
-    canonicalPath: string
+    canonicalPath: string,
+    canonicalMissing: boolean
   ): Promise<string[]> {
     const central = sidecarPathFor(pdfPath, {
       storageMode: "folder",
@@ -552,7 +599,12 @@ export class PdfBundleManager {
 
     // A unique fingerprint match recovers an old sidecar after the PDF was
     // already renamed or moved before this storage system was installed.
-    if (fingerprint) {
+    //
+    // This reads every sidecar in the vault, so it is gated on a rescue being
+    // possible AT ALL: if this document already has a sidecar, or a direct
+    // candidate was found above, there is nothing to rescue and the scan would
+    // just be a few hundred file reads on the path that renders the document.
+    if (fingerprint && canonicalMissing && existing.length === 0) {
       const index = await this.getLegacyFingerprintIndex([
         options.storageFolder ?? DEFAULT_ANNOTATION_FOLDER,
         DEFAULT_ANNOTATION_FOLDER,

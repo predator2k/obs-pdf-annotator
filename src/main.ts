@@ -56,7 +56,7 @@ interface LpaSettings {
   documentIdentity: DocumentIdentityMode;
   /** Legacy sidecar mode retained only for migration compatibility. */
   annotationStorageMode: AnnotationStorageMode;
-  /** Vault-relative folder searched for legacy sidecars and used for exports. */
+  /** Vault-relative folder holding annotation sidecars, mirroring each PDF's path. */
   annotationStorageFolder: string;
   /** User-defined highlight colors; null/absent = built-in palette. */
   customPalette: Array<{ name: string; fill: string; highlightAlpha?: number }> | null;
@@ -104,6 +104,8 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
   annotationHub!: AnnotationHub;
   private replacingCorePdfView = false;
   private nativePdfRefreshRaf: number | null = null;
+  /** Set in onunload so queued callbacks cannot re-inject UI afterwards. */
+  private unloaded = false;
 
   async onload(): Promise<void> {
     this.annotationHub = new AnnotationHub(this.app);
@@ -301,7 +303,10 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     // Accents and mark inks are computed per theme and baked into inline styles
     // at paint time, so a light/dark switch (or a snippet reload) has to force a
     // repaint — otherwise every open view keeps the previous theme's colors.
-    this.registerEvent(this.app.workspace.on("css-change", () => this.refreshAnnotationUi()));
+    // Debounced: Obsidian fires this on every snippet save and on every step of
+    // the font-size slider, and each one touches every mark in every open view.
+    const refreshForTheme = debounce(() => this.refreshAnnotationUi(), 250, true);
+    this.registerEvent(this.app.workspace.on("css-change", () => refreshForTheme()));
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (!(file instanceof TFile)) return;
@@ -331,8 +336,24 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
       window.cancelAnimationFrame(this.nativePdfRefreshRaf);
       this.nativePdfRefreshRaf = null;
     }
-    // Detach native overlays (removes injected DOM, observers, listeners) …
-    this.nativeOverlays.disable();
+    this.unloaded = true;
+    // Optional-chained: onunload also runs when onload threw partway, and a
+    // throw here would abort Obsidian's own teardown before it removes the
+    // plugin from its registry, leaving it wedged as loaded-but-unloadable.
+    this.nativeOverlays?.disable();
+    // Obsidian only auto-detaches our leaves when the USER disabled the plugin;
+    // on the update/reload path it does not, so release each view's resources
+    // explicitly. Without this a plugin update leaves a zombie view holding a
+    // pdf.js worker, its observers, and an unflushed store that can later write
+    // over a renamed document's sidecar.
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof PdfAnnotatorView) void view.releaseForPluginUnload();
+    }
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HTML_ANNOTATOR)) {
+      const view = leaf.view;
+      if (view instanceof HtmlAnnotatorView) view.releaseForPluginUnload();
+    }
     // … then revoke the worker Blob URL.
     //
     // The views themselves are NOT detached: Obsidian tears down the leaves of
@@ -407,6 +428,10 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
   /** Debounced sync of the native-PDF-view integration (toolbar controls +
    * overlay lifecycle). The overlay itself never calls setViewState. */
   private scheduleNativePdfRefresh(): void {
+    // onLayoutReady and the file-open retry timers are not cancellable, so they
+    // can still fire after unload and re-inject the toolbar into views that
+    // disable() has already cleaned.
+    if (this.unloaded) return;
     if (this.nativePdfRefreshRaf !== null) return;
     this.nativePdfRefreshRaf = window.requestAnimationFrame(() => {
       this.nativePdfRefreshRaf = null;
@@ -470,7 +495,12 @@ export default class LocalPdfAnnotatorPlugin extends Plugin {
     if (valid.length !== entries.length) {
       console.warn(`${LOG_TAG} ignored ${entries.length - valid.length} malformed palette entries`);
     }
-    this.settings.customPalette = valid;
+    // Only write back when there WAS a stored palette to clean up. Turning a
+    // null (meaning "use the built-ins") into [] would leave the settings
+    // editor — which treats only null as "show the defaults" — with zero rows
+    // on every default install, and "Restore defaults" could not repair it
+    // because it re-enters here immediately after setting null.
+    if (Array.isArray(raw)) this.settings.customPalette = valid;
   }
 
   pen(): PenState {
@@ -581,7 +611,7 @@ class LpaSettingTab extends PluginSettingTab {
         "Annotation sidecars are stored in this folder, mirroring each PDF's vault path " +
           "(e.g. Books/Novel.pdf → .pdf-annotate/Books/Novel.annotations.md). The default is " +
           "hidden from the file explorer; make sure your sync/backup tool includes it. " +
-          "Exports also land here."
+          "Exports are written separately, to a visible PDF exports folder."
       )
       .addText((t) => {
         t

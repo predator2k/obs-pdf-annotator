@@ -71,6 +71,43 @@ assert.equal(disambiguated!.beginOffset, 26, "and it is the SECOND occurrence, n
 const unique = findBestMatch("onlyoncehere", "once");
 assert.ok(unique && !unique.ambiguous, "a single occurrence is unambiguous");
 
+// --- accents distinguish words, they are not folded away -------------------
+// Folding marks would merge genuinely different words. These must NOT match.
+assert.notEqual(normStr("côte"), normStr("cote"), "French côte/cote stay distinct");
+assert.notEqual(normStr("tồi"), normStr("tôi"), "Vietnamese tồi/tôi stay distinct");
+assert.notEqual(normStr("мой"), normStr("мои"), "Russian мой/мои stay distinct");
+// Keeping the marks also keeps the link PRECISE: "côte" resolves to the
+// accented occurrence rather than colliding with "cote" earlier in the line.
+const homograph = findSelectionInChunks(
+  ["la cote du marche baisse, mais la côte est belle"],
+  "côte"
+);
+assert.ok(homograph, "an accented word still links");
+assert.equal(homograph!.beginOffset, 34, "and it points at the accented occurrence");
+
+// Non-Latin composition forms must also meet, since macOS hands over NFD.
+assert.equal(normStr("が"), normStr("が"), "Japanese dakuten: both forms normalize alike");
+assert.equal(normStr("한"), normStr("한"), "Hangul: precomposed and jamo normalize alike");
+
+// --- context disambiguates when the tail alone cannot ----------------------
+// Both occurrences share ", section two, " — only the earlier words differ, so
+// a scorer that looks at just the innermost characters ties and guesses.
+const chapters = [
+  "see chapter one, section two, the theory of value, and note the caveat. " +
+    "see chapter two, section two, the theory of value, and note the caveat.",
+];
+const wanted = findSelectionInChunks(
+  chapters,
+  "the theory of value",
+  "see chapter two, section two, ",
+  ", and note"
+);
+assert.ok(wanted, "a quote with distinguishing context still links");
+assert.ok(
+  wanted!.beginOffset > 60,
+  "and it resolves to the SECOND occurrence, the one the context describes"
+);
+
 // --- the drift fallback must not swallow unselected material ---------------
 const quote =
   "In the second chapter the author develops a theory of value that explains " +
@@ -85,9 +122,25 @@ assert.equal(
   "a head/tail pair separated by unselected material is rejected, not linked"
 );
 
-// Genuine minor drift (a ligature expanding) still anchors through the fallback.
+// A ligature is length-neutral after normalization, so this matches in pass 1
+// (it does NOT exercise the drift fallback — normalization already handles it).
 const drifted = "the ﬁrst deﬁnition of the term appears in the preface";
 const asTyped = "the first definition of the term appears in the preface";
+assert.equal(normStr(drifted), normStr(asTyped), "ligatures normalize to the same string");
 assert.ok(findSelectionInChunks([drifted], asTyped), "ligature drift still anchors");
+
+// The real job of the drift fallback: a quote broken by page furniture. The
+// running header and folio land between the halves in the document string.
+const crossPage =
+  "the argument developed in the preceding section now requires " +
+  "347 The Journal of Philosophy " +
+  "a considerably more careful statement than it has so far received";
+const quoted =
+  "the argument developed in the preceding section now requires " +
+  "a considerably more careful statement than it has so far received";
+assert.ok(
+  findSelectionInChunks([crossPage], quoted),
+  "a quote split by a running header still anchors through the drift fallback"
+);
 
 console.log("anchor smoke test passed");

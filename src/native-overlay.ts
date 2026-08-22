@@ -75,6 +75,9 @@ import { mayHandleDocumentKeys, type AnnotationHub } from "./annotation-hub";
 import { parseLegacyNote, targetBasename, type LegacyAnnotation } from "./legacy-import";
 import { fallbackAnnotationBinding, PdfBundleManager } from "./bundles";
 import { copyPdfDataForWorker } from "./pdf-data";
+
+/** Toolbar-injection retry budget (x350ms). A backstop, not a deadline. */
+const TOOLBAR_RETRY_LIMIT = 24;
 import {
   fitFoldedMarginCardHeights,
   layoutPageBoundedCardTops,
@@ -281,8 +284,12 @@ export class NativeOverlayManager {
       this.getMobileSelectionDelay
     );
     this.overlays.set(leaf, overlay);
-    this.refresh();
     try {
+      // Inside the try: refresh() reaches into Obsidian's toolbar DOM, and a
+      // throw here used to escape before `attaching` was cleared — pinning the
+      // leaf in that set forever, so it could never attach again and the toggle
+      // command silently did nothing.
+      this.refresh();
       await overlay.init();
       this.attachFailedFor.delete(leaf);
     } catch (e) {
@@ -313,6 +320,12 @@ export class NativeOverlayManager {
   private ensureControls(leaf: WorkspaceLeaf): boolean {
     const container = leaf.view.containerEl;
     const toolbar = container.querySelector<HTMLElement>(".pdf-toolbar");
+    // The PDF toolbar renders a beat after file-open. Reporting success from
+    // the view-header fallback immediately made `missingBar` never true, so the
+    // retry never ran and the controls sat in the header until some unrelated
+    // workspace event moved them — a migration that then rebuilt the group.
+    // Wait for the real toolbar while retries remain, and only then fall back.
+    if (!toolbar && this.retryCount < TOOLBAR_RETRY_LIMIT) return false;
     const bar =
       toolbar ??
       container.querySelector<HTMLElement>(".view-header .view-actions, .view-actions");
@@ -354,7 +367,7 @@ export class NativeOverlayManager {
     // large PDF on mobile can take several seconds, and running out used to
     // mean the swatches never appeared at all until an unrelated workspace
     // event happened to re-enter refresh().
-    if (this.retryTimer !== null || this.retryCount >= 24) return;
+    if (this.retryTimer !== null || this.retryCount >= TOOLBAR_RETRY_LIMIT) return;
     this.retryCount++;
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null;
@@ -544,6 +557,7 @@ export class NativePdfOverlay {
         file: this.file,
         store,
         reveal: (id) => this.revealAnnotation(id),
+        activeId: () => this.activeId,
         remove: (id) => {
           const page = store.get(id)?.page;
           store.remove(id);
@@ -682,6 +696,20 @@ export class NativePdfOverlay {
 
   ensureToolbarButtons(group: HTMLElement): void {
     if (this.destroyed) return;
+
+    // Decide FIRST whether the swatch group has to be rebuilt, and if so clear
+    // the old one before building anything else.
+    //
+    // Ordering matters more than it looks: removeToolbarButtons() also drops
+    // the fit-width button and the sidebar Annotations tab. Running it after
+    // those were (re)created destroyed them in the same call — closing an open
+    // annotations list and leaving no way back to it, because the fallback list
+    // button was skipped on the strength of a sidebar that had just been torn
+    // down.
+    const groupIsCurrent =
+      !!this.tagBtn && this.tagBtn.isConnected && this.tagBtn.parentElement === group;
+    if (!groupIsCurrent) this.removeToolbarButtons();
+
     this.ensureFitWidthButton();
     // BOTH pieces must exist before the list button may disappear: the
     // in-sidebar view AND the menu entry that opens it.
@@ -694,11 +722,10 @@ export class NativePdfOverlay {
       this.listBtn = null;
       if (this.listPanelEl) this.closeListPanel();
     }
-    if (this.tagBtn && this.tagBtn.isConnected && this.tagBtn.parentElement === group) {
+    if (groupIsCurrent) {
       this.syncToolbarState();
       return;
     }
-    this.removeToolbarButtons();
 
     // Colors: click to ARM (selections then highlight instantly); click the
     // armed color again to disarm and get the popover-on-selection flow back.
@@ -1072,12 +1099,16 @@ export class NativePdfOverlay {
     // as a dark page, or marks stay on multiply blending and turn to mud.
     let inverted = false;
     const win = root.ownerDocument.defaultView ?? window;
+    // Walk past the content root as well: snippets commonly invert the leaf
+    // container (.workspace-leaf-content[data-type="pdf"]), which sits ABOVE
+    // it, and stopping at the root missed exactly those.
+    const ceiling = root.closest(".workspace-leaf") ?? root.ownerDocument.body;
     for (let el: HTMLElement | null = canvas ?? root; el; el = el.parentElement) {
       if (win.getComputedStyle(el).filter.includes("invert")) {
         inverted = true;
         break;
       }
-      if (el === root) break;
+      if (el === ceiling) break;
     }
     if (inverted !== this.darkPages) {
       this.darkPages = inverted;
@@ -1419,7 +1450,7 @@ export class NativePdfOverlay {
     if (rotated) this.warnRotatedOnce();
     if (byPage.size === 0) return;
 
-    const context = selectionContext(sel);
+    const context = selectionContext(sel, this.contentRoot);
     // Obsidian's MOBILE text layer can sit offset from the painted glyphs
     // (observed on iPad): the DOM selection rects inherit that offset. The
     // plugin's own pdf.js text geometry is glyph-accurate — re-anchor the
@@ -1571,6 +1602,13 @@ export class NativePdfOverlay {
 
   /** Does this selection start inside the plugin's own UI rather than the page? */
   private selectionStartsInOwnUi(sel: Selection): boolean {
+    // A selection inside a text control lives in that control's shadow tree, so
+    // closest() from the anchor node cannot see our popover above it. WebKit
+    // (iPad) surfaces those selections through document.getSelection(), so
+    // "select all" inside a note field would otherwise be captured and, with a
+    // colour armed, committed as a phantom mark carrying the note's own text.
+    const active = this.contentRoot?.ownerDocument.activeElement as HTMLElement | null;
+    if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return true;
     const node = sel.anchorNode;
     const el = node?.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node?.parentElement;
     return !!el?.closest(
@@ -2891,9 +2929,13 @@ function pageContentBox(pageEl: HTMLElement): DOMRect | null {
 
 /** Has pdf.js actually rendered this page (as opposed to reserving its box)? */
 function isRenderedPage(pageEl: HTMLElement): boolean {
+  // Deliberately NOT counting our own .lpa-native-hl-layer: syncPages gives one
+  // to every ANNOTATED page, rendered or not, so accepting it would mark every
+  // annotated page of a 500-page document as on-screen forever — re-measuring
+  // them all on each scroll frame, which is the cost this filter removes.
   return (
     pageEl.hasAttribute("data-loaded") ||
-    !!pageEl.querySelector(":scope > .textLayer, :scope > .canvasWrapper, :scope > .lpa-native-hl-layer")
+    !!pageEl.querySelector(":scope > .textLayer, :scope > .canvasWrapper")
   );
 }
 

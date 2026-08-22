@@ -372,6 +372,11 @@
   display: none;
 }
 .lpa-roll-head {
+  /* Wrap instead of clipping: the fixed right padding plus a nowrap title, the
+     meta counter, the search box and the close button add up to ~516px, so on a
+     phone or any narrow pane the search field and the close "x" were pushed off
+     the right edge — leaving no way to dismiss the strip. */
+  flex-wrap: wrap;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -2240,8 +2245,8 @@
    flattening those with !important turns every code block in a saved article
    monochrome with no way for a user snippet to restore it. */
 .theme-dark .lpa-html-body
-  :where(p, div, section, article, li, td, th, h1, h2, h3, h4, h5, h6,
-    strong, em, b, i, u, blockquote, figcaption):not(pre *):not(code *) {
+  :where(p, div, section, article, li, td, th, dd, dt, h1, h2, h3, h4, h5, h6,
+    strong, em, b, i, u, small, font, span, blockquote, figcaption):not(pre *):not(code *):not(.lpa-html-mark) {
   color: var(--text-normal) !important;
   background-color: transparent !important;
 }

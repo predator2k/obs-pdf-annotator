@@ -45,7 +45,7 @@ import {
   shortAnnotationText,
   tagPreview,
 } from "./annotation-format";
-import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, selectionContext } from "./annotation-popover";
+import { bindPopoverAction, buildSelectionStyleRow, openAnnotationEditor, popoverEdgeInsets, selectionContext } from "./annotation-popover";
 import { copyHighlightLink } from "./copy-link";
 import { mayHandleDocumentKeys, type AnnotationHub } from "./annotation-hub";
 import { clampCssAlpha, markInkColor, MAX_HIGHLIGHT_ALPHA, parseColor, withAlpha, type Rgba } from "./color";
@@ -96,6 +96,10 @@ interface PageView {
   page: any | null;
   rendered: boolean;
   rendering: boolean;
+  /** Bumped by teardownPageContent so an in-flight render knows it was torn
+   * down. The global renderEpoch only changes on zoom/reload; a page can also
+   * be discarded on its own by scrolling out of the prefetch band. */
+  gen: number;
   renderTask: any | null;
   textTask: any | null;
 }
@@ -184,6 +188,8 @@ export class PdfAnnotatorView extends FileView {
 
   private io: IntersectionObserver | null = null;
   private visible = new Set<number>();
+  /** Detaches the in-flight tag drag's document listeners, if any. */
+  private tagDragDetach: (() => void) | null = null;
   private renderEpoch = 0;
   private loadToken = 0;
   private activeHighlightId: string | null = null;
@@ -278,7 +284,31 @@ export class PdfAnnotatorView extends FileView {
   }
 
   async onClose(): Promise<void> {
+    this.tagDragDetach?.();
+    this.tagDragDetach = null;
     await this.flushStore();
+    this.teardownDocument();
+  }
+
+  /**
+   * Release everything this view owns without closing its tab.
+   *
+   * Obsidian only detaches a plugin's leaves when the USER disabled it; on the
+   * update/reload path the leaf survives, and this instance belongs to a bundle
+   * that is going away. Left alone it keeps a pdf.js worker and its observers
+   * alive and, worse, its debounced save can later rewrite a sidecar the new
+   * instance has since moved. Detaching the leaf instead would close the user's
+   * open tabs on every update, so release the resources and keep the tab.
+   */
+  async releaseForPluginUnload(): Promise<void> {
+    this.tagDragDetach?.();
+    this.tagDragDetach = null;
+    this.hub?.unregister(this.hubKey);
+    try {
+      await this.flushStore();
+    } catch (e) {
+      console.error(`${LOG_TAG} failed to save annotations during unload`, e);
+    }
     this.teardownDocument();
   }
 
@@ -579,6 +609,12 @@ export class PdfAnnotatorView extends FileView {
         new Notice("PDF Annotator: annotation storage lookup failed — using the sidecar folder directly.");
       }
     }
+    // Resolving the binding does several vault round-trips, and loading the
+    // store does more. Without these checks a superseded load resumes here and
+    // installs the PREVIOUS file's store while the new PDF is on screen — every
+    // highlight the user then makes is written into the wrong document's
+    // sidecar, with this document's page indices.
+    if (token !== this.loadToken) return;
     this.store = new AnnotationStore(
       this.app.vault.adapter,
       binding.annotationPath,
@@ -590,6 +626,7 @@ export class PdfAnnotatorView extends FileView {
       binding.annotationBackupPath
     );
     await this.store.load();
+    if (token !== this.loadToken) return;
 
     if (this.hub) {
       const store = this.store;
@@ -598,6 +635,7 @@ export class PdfAnnotatorView extends FileView {
         file,
         store,
         reveal: (id) => this.revealHighlight(id, { scrollSidebar: true }),
+        activeId: () => this.activeHighlightId,
         remove: (id) => this.deleteAnnotation(id),
         copyLink: (id) => this.copyAnnotationLink(id),
         ownsLeaf: (leaf) => leaf === this.leaf,
@@ -605,6 +643,7 @@ export class PdfAnnotatorView extends FileView {
     }
 
     await this.buildPages();
+    if (token !== this.loadToken) return;
     this.renderAnnotationSidebar();
   }
 
@@ -670,7 +709,7 @@ export class PdfAnnotatorView extends FileView {
       const noteLayer = el.createDiv({ cls: "lpa-note-layer" });
       const pv: PageView = {
         index: i, el, hlLayer, noteLayer, canvas: null, textLayerEl: null,
-        page: i === 0 ? p1 : null, rendered: false, rendering: false, renderTask: null, textTask: null,
+        page: i === 0 ? p1 : null, rendered: false, rendering: false, gen: 0, renderTask: null, textTask: null,
       };
       this.pageViews.push(pv);
       this.io.observe(el);
@@ -1114,9 +1153,16 @@ export class PdfAnnotatorView extends FileView {
     if (!this.pdfDoc || pv.rendered || pv.rendering) return;
     pv.rendering = true;
     const epoch = this.renderEpoch;
+    const gen = pv.gen;
+    // Stale if the whole document was re-laid-out (zoom/reload) OR this one
+    // page was torn down on its own by scrolling out of the prefetch band.
+    // Checking only the epoch let a scroll-torn-down render run to completion
+    // and mark the page `rendered` with no canvas and no text layer, so
+    // scrolling back showed a blank page with floating highlights.
+    const stale = () => epoch !== this.renderEpoch || gen !== pv.gen;
     try {
       const page = pv.page ?? (await this.pdfDoc.getPage(pv.index + 1));
-      if (epoch !== this.renderEpoch) return;
+      if (stale()) return;
       pv.page = page;
 
       const base = page.getViewport({ scale: 1 });
@@ -1128,7 +1174,15 @@ export class PdfAnnotatorView extends FileView {
         height: `${Math.floor(viewport.height)}px`,
       });
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      // Cap the backing store. At high zoom a letter page reaches 7000x9500
+      // device pixels (~280 MB) and the prefetch band keeps several alive at
+      // once, which Chromium answers by failing the allocation and painting
+      // nothing. pdf.js's own viewer caps here for the same reason; going over
+      // just lowers effective DPI, which is invisible next to a blank page.
+      const rawDpr = Math.min(window.devicePixelRatio || 1, 2);
+      const maxPixels = 16_777_216;
+      const wanted = viewport.width * viewport.height * rawDpr * rawDpr;
+      const dpr = wanted > maxPixels ? rawDpr * Math.sqrt(maxPixels / wanted) : rawDpr;
       const canvas = document.createElement("canvas");
       canvas.width = Math.floor(viewport.width * dpr);
       canvas.height = Math.floor(viewport.height * dpr);
@@ -1147,13 +1201,13 @@ export class PdfAnnotatorView extends FileView {
       });
       pv.renderTask = renderTask;
       await renderTask.promise;
-      if (epoch !== this.renderEpoch) { this.teardownPageContent(pv); return; }
+      if (stale()) { this.teardownPageContent(pv); return; }
 
       const textLayerEl = pv.el.createDiv({ cls: "lpa-text-layer" });
       textLayerEl.style.setProperty("--scale-factor", String(this.scale));
       pv.textLayerEl = textLayerEl;
       const textContent = await page.getTextContent();
-      if (epoch !== this.renderEpoch) { this.teardownPageContent(pv); return; }
+      if (stale()) { this.teardownPageContent(pv); return; }
       const textTask = pdfjsLib.renderTextLayer({
         textContentSource: textContent,
         container: textLayerEl,
@@ -1162,14 +1216,17 @@ export class PdfAnnotatorView extends FileView {
       });
       pv.textTask = textTask;
       await textTask.promise;
-      if (epoch !== this.renderEpoch) { this.teardownPageContent(pv); return; }
+      if (stale()) { this.teardownPageContent(pv); return; }
 
       this.renderHighlights(pv);
       this.renderTags(pv);
       pv.rendered = true;
       this.renderAnnotationSidebar();
     } catch (e: any) {
-      if (e?.name !== "RenderingCancelledException") {
+      // A cancelled TEXT layer rejects with AbortException, and cancelling is
+      // routine here (every scroll out of the band, every zoom step), so it is
+      // not an error worth a stack trace.
+      if (e?.name !== "RenderingCancelledException" && e?.name !== "AbortException") {
         console.error(`${LOG_TAG} failed to render page ${pv.index + 1}`, e);
       }
       this.teardownPageContent(pv);
@@ -1181,7 +1238,10 @@ export class PdfAnnotatorView extends FileView {
       // IntersectionObserver does not re-fire for a target that was already
       // intersecting — so without this the page stays blank until it is
       // scrolled out of the prefetch band and back.
-      if (epoch !== this.renderEpoch && this.pdfDoc && this.visible.has(pv.index)) {
+      // `visible` holds page INDICES, so after a file switch a stale PageView
+      // can still match one the NEW document has on screen; require this exact
+      // element to still be in the document before re-rendering it.
+      if (stale() && this.pdfDoc && pv.el.isConnected && this.visible.has(pv.index)) {
         void this.renderPageContent(pv);
       }
     }
@@ -1207,6 +1267,17 @@ export class PdfAnnotatorView extends FileView {
     pv.hlLayer.empty();
     pv.noteLayer.empty();
     pv.rendered = false;
+    pv.gen++;
+    // Release pdf.js's per-page operator list, decoded images and fonts. Only
+    // the canvas was being freed, so reading through a long document grew
+    // memory monotonically with pages VISITED, with no ceiling. The proxy
+    // itself stays cached in pv.page; cleanup() only drops the render caches,
+    // and getViewport() still works afterwards.
+    try {
+      pv.page?.cleanup();
+    } catch {
+      /* a page mid-render refuses cleanup; it will be retried on next teardown */
+    }
     this.scheduleMarginLayout();
   }
 
@@ -1424,18 +1495,19 @@ export class PdfAnnotatorView extends FileView {
   private onMouseUp(evt: MouseEvent): void {
     if (!this.store) return;
     if (this.tagPlacementMode) return;
-    // Mobile capture flows solely through the debounced selectionchange
-    // handler, as in the other two views: firing here as well would pop the
-    // editor the instant the finger lifts from the long-press — on top of iOS's
-    // own callout, before the grabbers have been dragged — and then again after
-    // the configured delay.
-    if (Platform.isMobile) return;
     // A right-click has already opened the context menu for this hit; letting
     // the release also open the editor stacks a popover under the menu.
     if ((evt as PointerEvent).button !== undefined && (evt as PointerEvent).button !== 0) return;
     const doc = this.pagesEl.ownerDocument;
     const sel = doc.getSelection();
     if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+      // SELECTION capture only is mobile-exempt: there it flows through the
+      // debounced selectionchange handler, because firing on finger-lift would
+      // pop the editor on top of iOS's own callout before the grabbers have
+      // been dragged, and then again after the configured delay. Tapping an
+      // existing mark (the else branch) must still work on every platform —
+      // it is the only way to edit or delete one in this view on a phone.
+      if (Platform.isMobile) return;
       const pending = this.snapshotSelection(sel);
       if (pending) this.showSelectionHandle(pending);
       else this.hideSelectionActions(false);
@@ -1515,7 +1587,7 @@ export class PdfAnnotatorView extends FileView {
 
     const anchor = this.computeSelectionActionAnchor(sel, clientRects);
     if (!anchor) return null;
-    return { text, byPage, anchor, context: selectionContext(sel) };
+    return { text, byPage, anchor, context: selectionContext(sel, this.pagesEl) };
   }
 
   private computeSelectionActionAnchor(sel: Selection, rects: DOMRect[]): SelectionActionAnchor | null {
@@ -1607,12 +1679,17 @@ export class PdfAnnotatorView extends FileView {
     const vw = doc.documentElement.clientWidth;
     const vh = doc.documentElement.clientHeight;
     const sideGap = 10;
+    // Same edge reserve as the other three popovers: on mobile the bottom of
+    // the layout viewport sits behind Obsidian's toolbar and the home
+    // indicator, so clamping to the raw height leaves the swatch row visible
+    // but untappable.
+    const { edge, bottom } = popoverEdgeInsets(doc);
     let x = pending.anchor.side === "right"
       ? pending.anchor.x + sideGap
       : pending.anchor.x - pr.width - sideGap;
     let y = pending.anchor.y + pending.anchor.height / 2 - pr.height / 2;
-    x = clamp(8, x, Math.max(8, vw - pr.width - 8));
-    y = clamp(8, y, Math.max(8, vh - pr.height - 8));
+    x = clamp(edge, x, Math.max(edge, vw - pr.width - edge));
+    y = clamp(edge, y, Math.max(edge, vh - pr.height - bottom));
     pop.setCssProps({
       left: `${x}px`,
       top: `${y}px`,
@@ -2015,6 +2092,7 @@ export class PdfAnnotatorView extends FileView {
     };
     const up = (e: MouseEvent) => {
       detach();
+      this.tagDragDetach = null;
       const pageRect = pv.el.getBoundingClientRect();
       const xPct = clamp(0, ((e.clientX - pageRect.left) / Math.max(1, pageRect.width)) * 100, 100);
       const yPct = clamp(0, ((e.clientY - pageRect.top) / Math.max(1, pageRect.height)) * 100, 100);
@@ -2024,10 +2102,12 @@ export class PdfAnnotatorView extends FileView {
     doc.addEventListener("mousemove", move, true);
     doc.addEventListener("mouseup", up, true);
     // A drag can end without a mouseup we ever see (native drag, window switch,
-    // the view closing mid-drag). These are raw capture-phase document
-    // listeners, so without an owner they would stay attached for the session
-    // and later fire against a torn-down view.
-    this.register(detach);
+    // the view closing mid-drag), so the view has to be able to detach these
+    // raw capture-phase document listeners itself. ONE slot, not a new
+    // Component registration per drag: those only drain at view close, so each
+    // drag would permanently retain its PageView and that page's canvas.
+    this.tagDragDetach?.();
+    this.tagDragDetach = detach;
   }
 
   private computeAnnotationAnchor(h: Highlight): AnnotationAnchor | null {
